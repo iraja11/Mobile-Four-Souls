@@ -4,6 +4,7 @@ extends Node3D
 # Pilha LIFO com prioridade, dado na pilha, combate até alguém morrer, penalidade de morte, 4 almas vence.
 
 const D = preload("res://scripts/data.gd")
+const Sel = preload("res://scripts/select.gd")  # escolha de personagem + perfil (sequência)
 const FACE_UP := Basis(Vector3.RIGHT, -PI / 2)
 const FACE_DOWN := Basis(Vector3.RIGHT, PI / 2)
 const GOLD := Color(0.86, 0.68, 0.38)
@@ -207,7 +208,7 @@ func _ready() -> void:
 		if autoplay_human:
 			_autoplay_human_loop()
 		return
-	_show_select()
+	_new_game(Sel.pick())
 
 func _process(delta: float) -> void:
 	var t := Time.get_ticks_msec() / 1000.0
@@ -579,6 +580,7 @@ func _btn(txt: String, cb: Callable, primary := true) -> Button:
 	b.add_theme_stylebox_override("focus", StyleBoxEmpty.new())
 	b.add_theme_color_override("font_color", Color(0.98, 0.9, 0.75))
 	b.add_theme_color_override("font_disabled_color", Color(0.45, 0.42, 0.38))
+	b.pressed.connect(Sfx.play.bind("ui_click"))
 	b.pressed.connect(cb)
 	# Resposta tátil: afunda ao tocar, volta com mola.
 	b.button_down.connect(func():
@@ -976,6 +978,7 @@ func _plate_feedback(i: int, l: Label, now: Array) -> void:
 		amt = 1.35
 	elif now[0] > prev[0]:
 		col = Color(1.0, 1.5, 1.0)
+		Sfx.play("heal")
 	l.pivot_offset = l.size / 2
 	l.modulate = col
 	l.scale = Vector2(amt, amt)
@@ -984,6 +987,10 @@ func _plate_feedback(i: int, l: Label, now: Array) -> void:
 	t.tween_property(l, "modulate", Color.WHITE, 0.5)
 
 func _float3d(txt: String, pos: Vector3, col: Color, big := false) -> void:
+	if txt == "Prevenido":
+		Sfx.play("prevent")
+	elif txt == "ERROU" or txt == "IMUNE":
+		Sfx.play("block")
 	var l := _label3d(txt, 84 if big else 64, col)
 	l.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 	l.outline_size = 22 if big else 18
@@ -1181,74 +1188,16 @@ func _coin_fly(from: Vector3, p: Dictionary, n: int) -> void:
 		tw.tween_property(c, "scale", Vector3.ONE, 0.08)
 		tw.tween_method(step, 0.0, 1.0, randf_range(0.5, 0.65)).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN)
 		tw.tween_callback(func():
+			Sfx.play("coin", 1.0 + i * 0.06)  # sobe o tom a cada moeda
 			_burst(to, Color(1, 0.8, 0.3), 5, 1.2, 0.05, -2.0, 0.3)
 			(p.char_card as Card3D).punch(0.04)
 			c.queue_free())
 
 # =====================================================================
-# SELEÇÃO / FIM
+# FIM DE JOGO (a seleção de personagem é select.tscn)
 # =====================================================================
-func _show_select() -> void:
-	overlay.visible = true
-	for c in overlay.get_children():
-		c.queue_free()
-	var v := VBoxContainer.new()
-	v.set_anchors_preset(Control.PRESET_FULL_RECT)
-	v.alignment = BoxContainer.ALIGNMENT_CENTER
-	v.add_theme_constant_override("separation", 18)
-	overlay.add_child(v)
-	var t1 := _lbl("THE BINDING OF ISAAC", 16, GOLD, true)
-	t1.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	v.add_child(t1)
-	var t2 := _lbl("FOUR SOULS", 46, Color(0.95, 0.9, 0.8), true)
-	t2.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	v.add_child(t2)
-	var t3 := _lbl("Escolha seu personagem", 16, Color(0.8, 0.72, 0.6))
-	t3.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	v.add_child(t3)
-	var hb := GridContainer.new()
-	hb.columns = 4
-	hb.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
-	hb.add_theme_constant_override("h_separation", 10)
-	hb.add_theme_constant_override("v_separation", 10)
-	v.add_child(hb)
-	var k := 0
-	for c in D.CHARACTER_ORDER:
-		var b := TextureButton.new()
-		b.texture_normal = Card3D.tex(c)
-		b.ignore_texture_size = true
-		b.stretch_mode = TextureButton.STRETCH_KEEP_ASPECT_CENTERED
-		b.custom_minimum_size = Vector2(118, 160)
-		b.pivot_offset = Vector2(59, 80)
-		b.tooltip_text = D.CHARACTERS[c].name
-		b.pressed.connect(func():
-			# Escolha com peso: a carta salta e a tela some antes da partida.
-			for o in hb.get_children():
-				o.disabled = true  # toque duplo iniciava duas partidas ao mesmo tempo
-				if o != b:
-					o.create_tween().tween_property(o, "modulate:a", 0.0, 0.2)
-			var tw := b.create_tween()
-			tw.tween_property(b, "scale", Vector2(1.15, 1.15), 0.12).set_ease(Tween.EASE_OUT)
-			tw.tween_property(b, "scale", Vector2(1.08, 1.08), 0.1)
-			tw.tween_property(overlay, "modulate:a", 0.0, 0.3)
-			tw.tween_callback(func():
-				overlay.modulate.a = 1.0
-				_new_game(c)))
-		b.mouse_entered.connect(func(): b.create_tween().tween_property(b, "scale", Vector2(1.08, 1.08), 0.15))
-		b.mouse_exited.connect(func(): b.create_tween().tween_property(b, "scale", Vector2.ONE, 0.15))
-		hb.add_child(b)
-		# Flutuação ociosa
-		var bt := b.create_tween().set_loops()
-		bt.tween_property(b, "rotation", 0.025 if k == 0 else -0.025, 1.4 + k * 0.2).set_trans(Tween.TRANS_SINE)
-		bt.tween_property(b, "rotation", -0.025 if k == 0 else 0.025, 1.4 + k * 0.2).set_trans(Tween.TRANS_SINE)
-		k += 1
-	overlay.add_child(_embers2d(Color(1.0, 0.5, 0.2)))
-	var glow := t2.create_tween().set_loops()
-	glow.tween_property(t2, "modulate", Color(1.15, 1.05, 0.9), 1.6).set_trans(Tween.TRANS_SINE)
-	glow.tween_property(t2, "modulate", Color.WHITE, 1.6).set_trans(Tween.TRANS_SINE)
-	var t4 := _lbl("Você contra a CPU  ·  primeiro a %d almas vence" % D.SOULS_TO_WIN, 14, Color(0.7, 0.62, 0.52))
-	t4.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	v.add_child(t4)
+func _to_menu() -> void:
+	get_tree().change_scene_to_file("res://menu.tscn")
 
 # Brasas/confete 2D subindo do rodapé (telas de seleção e fim).
 func _embers2d(col: Color, n := 40) -> CPUParticles2D:
@@ -1298,6 +1247,9 @@ func _game_end(winner: Dictionary) -> void:
 	v.add_theme_constant_override("separation", 16)
 	overlay.add_child(v)
 	var won: bool = winner.i == 0
+	if not autoplay:
+		Sel.record(won, players[0].char)
+	Sfx.play("victory" if won else "defeat")
 	overlay.add_child(_embers2d(Color(1.0, 0.75, 0.3) if won else Color(0.8, 0.15, 0.1), 60 if won else 30))
 	var t := _lbl("VITÓRIA" if won else "DERROTA", 52, GOLD if won else Color(0.8, 0.25, 0.2), true)
 	t.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -1314,9 +1266,12 @@ func _game_end(winner: Dictionary) -> void:
 	var s := _lbl("%s reuniu %d almas." % [winner.name, winner.soul_n], 18)
 	s.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	v.add_child(s)
-	var b := _btn("JOGAR NOVAMENTE", func(): get_tree().reload_current_scene())
-	b.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
-	v.add_child(b)
+	var row := HBoxContainer.new()
+	row.alignment = BoxContainer.ALIGNMENT_CENTER
+	row.add_theme_constant_override("separation", 12)
+	row.add_child(_btn("JOGAR NOVAMENTE", func(): get_tree().reload_current_scene()))
+	row.add_child(_btn("PERSONAGEM", func(): get_tree().change_scene_to_file("res://select.tscn"), false))
+	v.add_child(row)
 
 # =====================================================================
 # SETUP DA PARTIDA
@@ -1347,6 +1302,7 @@ func _new_game(cid: String) -> void:
 	treasure_ids.shuffle()
 	monster_ids = D.MONSTERS.keys()
 	monster_ids.shuffle()
+	Sfx.riffle(8)
 	slots = [[], []]
 	shop = [null, null]
 	_sync_decks()
@@ -1471,6 +1427,7 @@ func _draw_loot(p: Dictionary, n := 1) -> void:
 			decks.discard.set_count(0)  # antes a pilha de descarte continuava desenhada cheia
 			decks.loot.bump()
 			_toast("Descarte embaralhado no deck de loot")
+			Sfx.riffle()
 		var id: String = loot_ids.pop_back()
 		decks.loot.set_count(loot_ids.size())
 		decks.loot.bump()
@@ -1530,6 +1487,7 @@ func _gain_item(p: Dictionary, id: String, from: Transform3D, eternal := false) 
 	if id == "momsshovel":
 		it.tapped = true  # entra em jogo desativado
 	_layout_items(p)
+	Sfx.play("item_gain")
 	get_tree().create_timer(0.4).timeout.connect(func():
 		if is_instance_valid(c) and c.zone == "item":
 			c.sheen()
@@ -1551,6 +1509,7 @@ func _nt(p: Dictionary, id: String) -> int:
 
 # Trinket resolvido: a própria carta de loot entra em jogo na fileira de itens do jogador.
 func _play_trinket(p: Dictionary, c: Card3D) -> void:
+	Sfx.play("trinket")
 	if c.get_parent() != table:
 		c.reparent(table, true)
 	c.bob = false
@@ -1743,6 +1702,7 @@ func _reveal_into(s: int, setup := false) -> void:
 	await c.fly_to(_slot_xf(s, depth), 0.32, 0.15).finished
 	c.punch(0.14)
 	_puff(c.global_position)
+	Sfx.play("event" if D.EVENTS.has(id) and not setup else "mon_reveal")
 	if D.EVENTS.has(id):
 		if setup:
 			# Na preparação, eventos voltam para o fundo do deck.
@@ -1793,6 +1753,8 @@ func _force_discard(p: Dictionary, n: int) -> void:
 func _lose_coins(p: Dictionary, n: int) -> void:
 	var lost: int = min(p.coins, n)
 	p.coins -= lost
+	if lost > 0:
+		Sfx.play("coin_lose")
 	_float3d("-%d¢" % lost, (p.char_card as Card3D).global_position, Color(1, 0.4, 0.3))
 	_ui()
 
@@ -1800,6 +1762,7 @@ func _recharge_first(p: Dictionary) -> bool:
 	for it in p.items:
 		if it.tapped:
 			it.tapped = false
+			Sfx.play("recharge")
 			_layout_items(p)
 			return true
 	return false
@@ -1890,6 +1853,7 @@ func _event_resolve(id: String, c: Card3D) -> void:
 			pass
 
 func _resolve_devil_deal(p: Dictionary) -> void:
+	Sfx.play("devil")
 	var choice := 0
 	if not p.bot:
 		choice = await _choose_option("Devil Deal", ["Descartar (nada)", "Loot 2, 1 de dano", "Tomar 2, buscar Guppy"], 0)
@@ -1950,6 +1914,9 @@ func _damage_monster(m: Dictionary, n: int, by: Dictionary) -> void:
 	c.punch(0.2)
 	c.shake()
 	c.flash_hit()
+	Sfx.play("mon_hit")
+	if randf() < 0.45:
+		Sfx.play("mon_grunt")
 	c.set_gore(0.3 + 0.7 * (1.0 - float(maxi(m.hp, 0)) / float(m.max)))
 	var at := c.global_position + Vector3(0, 0.08, 0)
 	_burst(at, Color(1, 0.55, 0.2), 22, 3.0, 0.06, -5.0, 0.45)
@@ -1992,6 +1959,8 @@ func _kill_monster(m: Dictionary, by: Dictionary) -> void:
 	_splat(pos, 1.6, 0.05)
 	c.set_gore(1.0)
 	_cam_shake(0.25)
+	Sfx.play("mon_kill")
+	Sfx.play("splat")
 	_hitstop(0.05)
 	# Recompensas
 	var roll_val: int = int(m.get("kill_roll", 1))
@@ -2019,6 +1988,7 @@ func _kill_monster(m: Dictionary, by: Dictionary) -> void:
 		var tw := c.fly_to(up, 0.4, 0.0)
 		_burst(at, Color(0.6, 0.85, 1.0), 45, 2.2, 0.09, 1.2, 1.4)
 		_float3d("+%d ALMA" % int(d[7]), pos, Color(0.75, 0.9, 1), true)
+		Sfx.play("soul")
 		c.highlight(true, Color(0.55, 0.8, 1.0))
 		tw.finished.connect(func():
 			c.sheen(0.5)
@@ -2178,14 +2148,17 @@ func _check_bonus_souls() -> void:
 		if not bonus_souls_taken.has("soulofgreed") and q.coins >= 25:
 			bonus_souls_taken["soulofgreed"] = q.i
 			q.soul_n += 1
+			Sfx.play("bonus_soul")
 			_toast("%s ganhou a Alma de Greed!" % q.name)
 		if not bonus_souls_taken.has("soulofgluttony") and q.hand.size() >= 10:
 			bonus_souls_taken["soulofgluttony"] = q.i
 			q.soul_n += 1
+			Sfx.play("bonus_soul")
 			_toast("%s ganhou a Alma de Gluttony!" % q.name)
 		if not bonus_souls_taken.has("soulofguppy") and _guppy_count(q) >= 2:
 			bonus_souls_taken["soulofguppy"] = q.i
 			q.soul_n += 1
+			Sfx.play("bonus_soul")
 			_toast("%s ganhou a Alma de Guppy!" % q.name)
 		if q.soul_n >= D.SOULS_TO_WIN and not game_over:
 			winner = q
@@ -2258,6 +2231,7 @@ func _damage_player(p: Dictionary, n: int, src) -> void:
 	var cc: Card3D = p.char_card
 	cc.punch(0.2)
 	cc.flash_hit(1.0)
+	Sfx.play("hurt", 1.0 if p.i == 0 else 1.12)
 	_float3d("-%d ♥" % n, cc.global_position, Color(1, 0.25, 0.2), true)
 	_burst(cc.global_position + Vector3(0, 0.08, 0), Color(0.55, 0.02, 0.03, 0.95), 16, 2.2, 0.08, -6.0, 0.6, false)
 	_burst(cc.global_position + Vector3(0, 0.08, 0), Color(1, 0.3, 0.2), 10, 2.0, 0.05, -3.0, 0.35)
@@ -2487,6 +2461,7 @@ func _kill_player(p: Dictionary) -> void:
 	var cc: Card3D = p.char_card
 	cc.dim(true)
 	cc.set_gore(1.0)
+	Sfx.play("die")
 	_splat_around(cc.global_position, 3, 1.1, 0.15)
 	_burst(cc.global_position + Vector3(0, 0.1, 0), Color(0.05, 0.03, 0.03, 0.8), 24, 1.4, 0.3, 0.8, 1.4, false)
 	_burst(cc.global_position + Vector3(0, 0.1, 0), Color(0.9, 0.1, 0.05), 30, 3.5, 0.07, -5.0, 0.7)
@@ -2599,6 +2574,9 @@ func _start_phase(p: Dictionary) -> void:
 		turn_over = true
 		return
 	_banner("SEU TURNO" if p.i == 0 else "TURNO DE %s" % p.name.to_upper(), Color(1, 0.9, 0.7) if p.i == 0 else Color(0.85, 0.8, 0.95))
+	Sfx.play("banner", 1.0 if p.i == 0 else 0.85, 0.0 if p.i == 0 else -3.0)
+	if p.items.any(func(it): return it.tapped):
+		Sfx.later("recharge", 0.3)
 	for it in p.items:
 		it.tapped = false
 	p.char_tapped = false
@@ -2999,6 +2977,10 @@ func _dice_landed(v: int) -> void:
 	elif v == 1:
 		col = Color(1, 0.35, 0.3)
 	_float3d(str(v), dice.global_position + Vector3(0, 0.15, 0), col, true)
+	if v == 6:
+		Sfx.play("roll_6")
+	elif v == 1:
+		Sfx.play("roll_1")
 
 # =====================================================================
 # AÇÕES (compartilhadas por humano e CPU)
@@ -3017,6 +2999,7 @@ func _act_attack(p: Dictionary, s: int) -> void:
 	# Câmera aproxima levemente do monstro durante o combate.
 	cam_focus_target = Vector3((m.card as Card3D).position.x * 0.15, -0.35, -0.3)
 	(p.char_card as Card3D).lunge((m.card as Card3D).global_position, 0.2)
+	Sfx.play("attack")
 	_ui()
 	if _has_tag(m, "pride_declare"):
 		_force_discard(_opp(p), 2)
@@ -3086,6 +3069,7 @@ func _resolve_attack(p: Dictionary, mu: int, v: int) -> void:
 		_toast("Acerto! %d de dano" % dmg, Color(1, 0.9, 0.55))
 		# Investida do personagem; o dano entra no impacto.
 		pc.lunge(mc.global_position, 0.35)
+		Sfx.play("swing")
 		await _wait(0.17)
 		if _find_mon(mu) == null or p.dead:
 			return
@@ -3105,6 +3089,7 @@ func _resolve_attack(p: Dictionary, mu: int, v: int) -> void:
 		_toast("Errou — %s causa %d" % [D.MONSTERS[m.id][0], d], Color(1, 0.6, 0.5))
 		_float3d("ERROU", mc.global_position, Color(0.85, 0.8, 0.75))
 		mc.lunge(pc.global_position, 0.4)
+		Sfx.play("mon_grunt")
 		await _wait(0.17)
 		if p.dead or game_over:
 			return
@@ -3137,6 +3122,7 @@ func _act_buy(p: Dictionary, s: int) -> void:
 		c.queue_free()
 		shop[s] = null
 	p.bought += 1
+	Sfx.play("buy")
 	_toast("%s comprou %s" % [p.name, D.ITEMS[id][0]])
 	_gain_item(p, id, from)
 	_ui()
@@ -3148,6 +3134,7 @@ func _act_tap_char(p: Dictionary) -> void:
 	if p.char_tapped:
 		return
 	p.char_tapped = true
+	Sfx.play("char_tap")
 	p.loot_plays += 1
 	_layout_items(p)
 	_ui()
@@ -3171,6 +3158,7 @@ func _act_play_loot(p: Dictionary, c: Card3D, target = null) -> void:
 	c.bob = false
 	c.highlight(false)
 	c.zone = "stack"
+	Sfx.play("card_play")
 	_layout_hand(p)
 	var id: String = c.id
 	var e := {"kind": "loot", "owner": p, "name": D.LOOT[id][0], "card": c, "target": target}
@@ -3547,6 +3535,7 @@ func _destroy_item(p: Dictionary, it: Dictionary) -> void:
 	if it.id == "thechest":
 		_item_to_soul(p, it)
 		return
+	Sfx.play("destroy")
 	if p.items.has(it):
 		p.items.erase(it)
 	_discard_item(it)
@@ -3689,6 +3678,7 @@ func _act_paid(p: Dictionary, it: Dictionary, target = null) -> void:
 			_layout_items(p)
 			_layout_items(_opp(p))
 			_gain_coins(p, 8, ppos)
+	Sfx.play("item_use")
 	_ui()
 
 func _act_item(p: Dictionary, it: Dictionary, target = null) -> void:
@@ -3872,6 +3862,7 @@ func _act_item(p: Dictionary, it: Dictionary, target = null) -> void:
 		_:
 			return
 	it.tapped = true
+	Sfx.play("item_use")
 	_layout_items(p)
 	# Cópia fantasma do item sobe para a pilha.
 	(it.card as Card3D).sheen(0.4)
@@ -4156,6 +4147,7 @@ func _human_item_paid(it: Dictionary) -> void:
 	await _act_paid(me, it, target)
 
 func _open_inspect(tex_id: String, title: String, text: String, btns: Array) -> void:
+	Sfx.play("inspect")
 	inspect.visible = true
 	insp_tex.texture = Card3D.tex(tex_id)
 	insp_title.text = title

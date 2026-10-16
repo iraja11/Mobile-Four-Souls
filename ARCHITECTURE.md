@@ -5,9 +5,15 @@ Adaptação digital de *The Binding of Isaac: Four Souls* (Base Game V2). 1 huma
 ## Árvore
 ```
 game/
-├─ project.godot          # cena principal: main.tscn
-├─ main.tscn              # só um Node3D com scripts/main.gd
+├─ project.godot          # cena inicial: menu.tscn · autoload Settings, Sfx
+├─ menu.tscn              # só um Control com scripts/menu.gd
+├─ select.tscn            # só um Control com scripts/select.gd
+├─ main.tscn              # só um Node3D com scripts/main.gd (partida)
 ├─ scripts/
+│  ├─ menu.gd             # menu principal: Novo Jogo → select.tscn · Opções (volumes, tela cheia) · classe Scrawl
+│  ├─ select.gd           # seleção de personagem (anel girável, atributos/item, "?" aleatório, sequência de vitórias) + perfil
+│  ├─ settings.gd         # autoload Settings: opções em user://settings.cfg, buses Master/Music/SFX
+│  ├─ sfx.gd              # autoload Sfx: tabela evento→amostras, variação, cooldown, vozes, limitador
 │  ├─ main.gd   (~4.5k)   # TODO o jogo: mundo 3D, HUD, regras, efeitos, CPU, autoplay
 │  ├─ data.gd             # banco de cartas (consts puras, sem lógica)
 │  ├─ card3d.gd           # class_name Card3D: carta física, shaders, animações, toque
@@ -15,7 +21,10 @@ game/
 │  └─ dice3d.gd           # class_name Dice3D: dado animado
 ├─ assets/
 │  ├─ cards/<id>.jpg      # arte por id de carta (id = chave em data.gd)
-│  ├─ fonts/              # NotoSerif (UI) + DejaVuSans (fallback de símbolos)
+│  ├─ fonts/              # NotoSerif (UI da partida) + DejaVuSans (fallback) + Upheaval (menu, pixel)
+│  ├─ sfx/<nome>.wav      # efeitos escolhidos de ../tboi sounds (minúsculas, espaço→_)
+│  ├─ ui/                 # logo + recortes da UI do TBOI (quadros de papel, seta, rabiscos) usados no menu
+│  │  └─ select/          # recortes de charactermenu.png: quadro "WHO AM I?", nomes, setas, ícones ♥/espada, "?", sangue
 │  └─ table.jpg
 └─ tools/autoplay.sh      # partidas headless (teste de fumaça)
 ```
@@ -45,7 +54,9 @@ Comportamento de monstro = tags em `main.gd › MON_TAG` (`id → [tag...]`), li
 
 ## Fluxo
 ```
-_ready → _show_select → _new_game(char) → _turn_loop
+menu.tscn: Novo Jogo → select.tscn → main.tscn · Opções ↔ quadro de opções (salva ao voltar) · --autoplay* pula direto p/ main.tscn
+select.tscn: escolhe → Sel.chosen/random_mode (statics) · ‹ VOLTAR → menu
+main._ready → _new_game(Sel.pick()) → _turn_loop   (Sel.pick re-sorteia no "jogar novamente" se veio do "?")
 _turn_loop: _start_phase(p) → [_bot_turn | humano até end_turn_requested] → _end_phase(p) → troca active
 Ação (loot/item/ataque) → _push(entry) → _run_stack:
     loop: prioridade (humano: botão PASSAR se _human_relevant; CPU: _bot_respond) → pop → _resolve(e)
@@ -61,7 +72,7 @@ Sinais internos: `priority_event`, `end_turn_requested`, `roll_requested`, `targ
 | topo | consts, `MON_TAG`, sinais, variáveis de mundo/estado/game feel/HUD |
 | MUNDO 3D | mesa, câmera, luz, velas; transforms de zona (`_hand_xf`, `_item_xf`, `_slot_xf`...) |
 | HUD 2D | placas, botões, feed de mensagens (`_toast`), faixa (`_banner`), inspeção, partículas, sangue, moedas, hitstop, tremor |
-| SELEÇÃO / FIM | tela de personagem e de vitória/derrota |
+| FIM DE JOGO | vitória/derrota: `Sel.record` (sequência + vitórias por personagem), JOGAR NOVAMENTE / PERSONAGEM |
 | SETUP DA PARTIDA | `_new_player`, `_new_game` (Eden escolhe item), modais |
 | CARTAS | compra de loot, layout de mão/itens, ganhar/descartar item, trinkets (`_play_trinket`, `_discard_item`), loja |
 | MONSTROS | revelar, evasão (`_eva`), eventos (`_event_resolve`), dano e morte de monstro + recompensas |
@@ -87,3 +98,5 @@ Sinais internos: `priority_event`, `end_turn_requested`, `roll_requested`, `targ
 - `D` = `preload("res://scripts/data.gd")`. Card3D/Deck3D/Dice3D são classes globais.
 - Toda animação passa por `Card3D.fly_to/punch/shake/lunge/sheen`; efeitos visuais por `_burst`, `_splat`, `_float3d`.
 - `.godot/` é cache (fora do git).
+- Som: sempre `Sfx.play("evento")` (ou `Sfx.later`, `Sfx.riffle`); evento novo = linha em `sfx.gd › EV` `[amostras, dB, ±pitch, cooldown, vozes]` + wav em `assets/sfx/`. Nada de AudioStreamPlayer solto. Ganchos: `_btn` (clique), `Card3D.fly_to` (deslize se distância > 0.6), `press_pulse`, `Dice3D.throw` (quiques), `_float3d` ("Prevenido"/"ERROU"/"IMUNE"), `_plate_feedback` (cura) e as funções de regra (dano, morte, moedas, alma, compra...). Em headless o Sfx não toca (só valida). Eventos `char_*` prontos para a tela de seleção. Bus Music ainda sem uso (não há trilha na lista).
+- Menu: estilo "tinta no papel" em `menu.gd` (Upheaval desenhada letra a letra torta pela classe `Scrawl`, traços do sprite como trilho de slider); a seleção (`select.gd`) reusa `Scrawl` e desenha bilhetes/tachinhas (`Note`/`Tack`) no mesmo estilo; a partida usa o estilo dourado de `main.gd › _btn/_panel_style`.

@@ -257,6 +257,7 @@ func set_hover(on: bool) -> void:
 
 # Toque rápido no celular: um "hover" breve como resposta tátil.
 func press_pulse() -> void:
+	Sfx.play("card_tap")
 	set_hover(true)
 	var t := create_tween()
 	t.tween_interval(0.22)
@@ -369,6 +370,10 @@ func fly_to(target: Transform3D, dur := 0.45, arc := 0.5) -> Tween:
 	var s0 := from.basis.get_scale()
 	var s1 := target.basis.get_scale()
 	var up := Vector3.UP * arc
+	# Deslize de papel só em viagens de verdade (reajuste de leque fica mudo); mais longe, mais alto.
+	var dist := from.origin.distance_to(target.origin)
+	if dist > 0.6 and is_visible_in_tree():
+		Sfx.play("card_slide", 1.0, linear_to_db(clampf(dist / 2.5, 0.35, 1.0)))
 	var step := func(t: float) -> void:
 		var p := from.origin.lerp(target.origin, t) + up * sin(t * PI)
 		transform = Transform3D(Basis(q0.slerp(q1, t)).scaled(s0.lerp(s1, t)), p)

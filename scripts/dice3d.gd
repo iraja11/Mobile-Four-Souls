@@ -79,6 +79,9 @@ func throw(v: int, from: Vector3, to: Vector3) -> void:
 		var p := from.lerp(to, 1.0 - pow(1.0 - t, 2.0))
 		p.y = to.y + (from.y - to.y) * (1.0 - t) * absf(cos(t * PI * 2.5))
 		position = p
+	# Quiques em t = 0.2, 0.6 e 1.0 (zeros do |cos| em `step`), cada um mais fraco.
+	for k in 3:
+		Sfx.later("dice", 0.85 * (0.2 + 0.4 * k), 1.0 + 0.05 * k, -5.0 * k)
 	var tw := create_tween().set_parallel()
 	tw.tween_method(step, 0.0, 1.0, 0.85)
 	tw.tween_property(self, "rotation", final, 0.85).from(final + spin).set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_CUBIC)
