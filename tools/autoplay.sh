@@ -13,9 +13,10 @@ done
 wait
 fail=0
 for s in "${SEEDS[@]}"; do
-	e=$(grep -c "ERROR" "$LOG/s$s.log"); [ "$e" -gt 0 ] && fail=1
+	# "... at exit" (recursos/páginas em uso): quit() no GAME OVER com corrotinas pendentes; não é erro de jogo
+	e=$(grep -v "at exit" "$LOG/s$s.log" | grep -c "ERROR"); [ "$e" -gt 0 ] && fail=1
 	g=$(grep -o "GAME OVER.*" "$LOG/s$s.log" || echo "SEM FIM (timeout?)")
 	echo "seed $s · erros=$e · $g"
 done
-grep -h -A2 "ERROR" "$LOG"/s*.log | grep -v '^--' | sort | uniq -c | sort -rn | head -20
+for s in "${SEEDS[@]}"; do grep -v "at exit" "$LOG/s$s.log"; done | grep -A2 "ERROR" | grep -v '^--' | sort | uniq -c | sort -rn | head -20
 exit $fail

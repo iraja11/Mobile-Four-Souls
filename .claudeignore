@@ -1,0 +1,31 @@
+# Extensões de Mídia e Assets
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.ogg
+*.wav
+*.mp3
+*.tmp
+
+# Pastas da Godot Engine (Bloqueia tudo dentro delas)
+.godot/
+**/_godot_/**
+.import/
+**/.import/**
+
+# Pastas de Build e Binários
+bin/
+**/bin/**
+build/
+**/build/**
+export/
+**/export/**
+android/
+**/android/**
+
+# Controle de Versão e IDEs
+.git/
+**/.git/**
+.vscode/
+**/.vscode/**

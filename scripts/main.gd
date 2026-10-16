@@ -5,9 +5,9 @@ extends Node3D
 
 const D = preload("res://scripts/data.gd")
 const Sel = preload("res://scripts/select.gd")  # escolha de personagem + perfil (sequência)
+const XP = preload("res://scripts/xp.gd")  # cartas das expansões (FS+, Requiem, Summer, Anniversary)
 const FACE_UP := Basis(Vector3.RIGHT, -PI / 2)
 const FACE_DOWN := Basis(Vector3.RIGHT, PI / 2)
-const GOLD := Color(0.86, 0.68, 0.38)
 
 # Comportamentos especiais de monstros, por id (Consultar data.gd MONSTERS[i][8] para o texto).
 const MON_TAG := {
@@ -79,6 +79,14 @@ const MON_TAG := {
 	"wrath": ["wrath_death"],
 	"mom": ["dbl1", "monster_expand_death"],
 	"satan": ["satan6"],
+	# Expansões que reaproveitam comportamentos acima (o resto fica em xp.gd, por id).
+	"flaminghopper": ["immune6"],
+	"sucker": ["boom_death"],
+	"charmedkeeper": ["keeperhead_coin"],
+	"charmedfatty": ["scolex_discard"],
+	"guttedfatty": ["monster_expand_death"],
+	"mulligoon": ["noheal"],
+	"shopkeeper": ["untargetable"],
 }
 
 # Itens que são Trinkets (Loot) cujo efeito fica passivo em jogo.
@@ -92,6 +100,7 @@ signal target_chosen(t)
 # ---------------- Mundo ----------------
 var font_b: FontFile
 var font_r: FontFile
+var font_ui: FontFile  # Upheaval, a mesma do menu
 var cam: Camera3D
 var cam_base: Vector3
 var table: Node3D
@@ -133,8 +142,16 @@ var monster_discard: Array = []
 var treasure_discard: Array = []
 var bonus_souls_taken := {}
 var pending_extra_turn := -1
-const GUPPY_ITEMS := ["guppyshead", "guppyspaw", "guppyscollar", "guppyshairball"]
+const GUPPY_ITEMS := ["guppyshead", "guppyspaw", "guppyscollar", "guppyshairball", "guppyseye"]
 var refilling := false
+# Expansões: salas (Requiem), alvos atacáveis que não são monstros, estado por turno.
+var xp
+var room_ids: Array = []
+var room_discard: Array = []
+var rooms: Array = []        # {id, card, tapped, counters, state}
+var xtargets: Array = []     # pseudo-monstros: itens/salas/almas/jogadores atacáveis
+var monster_died := false    # algum monstro morreu neste turno (troca de sala no fim)
+var combat_damage := false   # o dano em curso é de combate
 
 # ---------------- Game feel ----------------
 const HAND_HALF := 0.62        # meia-largura útil da mão (espaço da câmera), deixa o botão livre
@@ -152,10 +169,9 @@ var drag_active := false
 # ---------------- HUD ----------------
 var hud: CanvasLayer
 var plates: Array = []
-var phase_lbl: Label
 var hint_lbl: Label
 var stack_panel: PanelContainer
-var stack_list: Label
+var stack_list: RichTextLabel
 var pass_btn: Button
 var action_btn: Button
 var prompt_panel: PanelContainer
@@ -163,16 +179,18 @@ var prompt_lbl: Label
 var inspect: Control
 var insp_tex: TextureRect
 var insp_title: Label
-var insp_text: Label
+var insp_text: RichTextLabel
+var insp_note: PanelContainer
+var insp_box: VBoxContainer
+var insp_forced := false  # escolha obrigatória: tocar fora não fecha
 var insp_btns: HBoxContainer
 var flash: ColorRect
 var overlay: Control
 var feed: VBoxContainer
 var banner: Control
-var banner_band: ColorRect
+var banner_band: Panel
 var banner_lbl: Label
 var plate_prev: Array = [[], []]
-var plate_styles: Array = []
 var hud_root: Control
 var vig_mat: ShaderMaterial
 var danger_on := false
@@ -192,7 +210,10 @@ func _ready() -> void:
 	font_r = load("res://assets/fonts/NotoSerif-Regular.ttf")
 	font_b.fallbacks = [fallback]
 	font_r.fallbacks = [fallback]
+	font_ui = load("res://assets/fonts/Upheaval.ttf")
+	font_ui.fallbacks = [fallback]
 	get_viewport().physics_object_picking = true
+	xp = XP.new(self)
 	_build_world()
 	_build_hud()
 	if "--autoplay" in OS.get_cmdline_args() or "--autoplay" in OS.get_cmdline_user_args() \
@@ -205,10 +226,28 @@ func _ready() -> void:
 			if a.begins_with("--seed="):
 				seed(int(a.trim_prefix("--seed=")))
 		_new_game(D.CHARACTER_ORDER[randi() % D.CHARACTER_ORDER.size()])
+		_autoplay_shots()
 		if autoplay_human:
 			_autoplay_human_loop()
 		return
+	_fade_in()
 	_new_game(Sel.pick())
+
+# Véu preto que some depois dos primeiros quadros (a seleção sai em fade para preto; sem isso a troca de cena piscava cinza).
+func _fade_in() -> void:
+	var veil := CanvasLayer.new()
+	veil.layer = 100
+	add_child(veil)
+	var r := ColorRect.new()
+	r.color = Color.BLACK
+	r.set_anchors_preset(Control.PRESET_FULL_RECT)
+	r.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	veil.add_child(r)
+	for i in 3:  # espera a compilação de shaders dos primeiros quadros
+		await get_tree().process_frame
+	var tw := r.create_tween()
+	tw.tween_property(r, "color:a", 0.0, 0.45)
+	tw.tween_callback(veil.queue_free)
 
 func _process(delta: float) -> void:
 	var t := Time.get_ticks_msec() / 1000.0
@@ -297,27 +336,24 @@ func _build_world() -> void:
 	fill.light_energy = 0.18
 	add_child(fill)
 
-	# Mesa + feltro
-	var tm := StandardMaterial3D.new()
-	tm.albedo_texture = load("res://assets/table.jpg")
-	tm.uv1_scale = Vector3(2.2, 2.2, 1)
-	tm.roughness = 0.8
-	tm.albedo_color = Color(0.75, 0.62, 0.52)
+	# Mesa: tábuas do tabuleiro do TBOI em escala real (antes esticadas ~18 u e borradas), com relevo
+	# tirado da própria luminância e veio fino procedural; tapete costurado com as zonas impressas.
 	var tbl := MeshInstance3D.new()
 	var pm := PlaneMesh.new()
 	pm.size = Vector2(40, 40)
 	tbl.mesh = pm
-	tbl.material_override = tm
+	tbl.material_override = _table_material()
 	tbl.position = Vector3(0, -0.002, -0.6)
 	add_child(tbl)
-	var felt_border := _plane(Vector2(4.75, 5.85), Color(0.32, 0.22, 0.12), 0.6)
-	felt_border.position = Vector3(0, -0.001, -0.95)
-	add_child(felt_border)
-	var felt := _plane(Vector2(4.6, 5.7), Color(0.11, 0.06, 0.055), 1.0)
+	var felt := MeshInstance3D.new()
+	var fpm := PlaneMesh.new()
+	fpm.size = Vector2(4.75, 5.85)
+	felt.mesh = fpm
+	felt.material_override = _mat_material()
 	felt.position = Vector3(0, 0.0, -0.95)
 	add_child(felt)
 	# Camada 2 = superfícies que recebem respingos (decals não mancham as cartas, que ficam só na camada 1).
-	for s in [tbl, felt_border, felt]:
+	for s in [tbl, felt]:
 		s.layers = 3
 	for k in 5:
 		blood_texs.append(_splat_tex(k * 7919 + 13))
@@ -325,9 +361,12 @@ func _build_world() -> void:
 	table = Node3D.new()
 	add_child(table)
 
-	# Velas
-	for p in [Vector3(-2.6, 0, -3.6), Vector3(2.65, 0, -2.0), Vector3(-2.7, 0, 0.6)]:
-		_candle(p)
+	# Velas em pratos (grupos de alturas diferentes) e moedas largadas nas margens.
+	# Ficam na faixa de madeira do topo: nas laterais a perspectiva "deita" tudo que é vertical.
+	_candle_dish(Vector3(-2.0, 0, -4.5), 3)
+	_candle_dish(Vector3(2.3, 0, -4.75), 1)
+	_coin_pile(Vector3(1.5, 0, -4.25), 6)
+	_coin_pile(Vector3(-1.05, 0, -4.15), 2)
 
 	# Poeira na luz
 	var dust := GPUParticles3D.new()
@@ -359,10 +398,11 @@ func _build_world() -> void:
 	for d in [["monster", "monsterback", "MONSTROS", Vector3(-1.65, 0, -1.55)],
 			["treasure", "treasureback", "TESOUROS", Vector3(-1.65, 0, -0.3)],
 			["loot", "lootback", "LOOT", Vector3(1.65, 0, -0.3)],
-			["discard", "lootback", "DESCARTE", Vector3(1.65, 0, -1.55)]]:
+			["discard", "lootback", "DESCARTE", Vector3(1.65, 0, -1.55)],
+			["room", "roomback", "SALAS", Vector3(-1.65, 0, -2.42)]]:
 		var dk := Deck3D.new()
 		table.add_child(dk)
-		dk.setup(d[1], d[2], font_b)
+		dk.setup(d[1], d[2], font_ui)
 		dk.position = d[3]
 		decks[d[0]] = dk
 		dk.tapped.connect(_on_deck_tapped.bind(d[0]))
@@ -374,8 +414,8 @@ func _build_world() -> void:
 	table.add_child(shop_lbl)
 
 	opp_hand_root = Node3D.new()
-	opp_hand_root.position = Vector3(0, 0.55, -4.0)
-	opp_hand_root.rotation = Vector3(-0.35, PI, 0)
+	opp_hand_root.position = Vector3(0, 0.95, -3.4)
+	opp_hand_root.rotation = Vector3(-0.55, PI, 0)
 	table.add_child(opp_hand_root)
 
 	dice = Dice3D.new()
@@ -393,35 +433,251 @@ func _plane(sz: Vector2, col: Color, rough: float) -> MeshInstance3D:
 	mi.material_override = m
 	return mi
 
-func _candle(pos: Vector3) -> void:
-	var h := randf_range(0.35, 0.6)
+func _table_material() -> ShaderMaterial:
+	var sh := Shader.new()
+	sh.code = """shader_type spatial;
+uniform sampler2D tex : source_color, filter_linear_mipmap_anisotropic, repeat_enable;
+varying vec2 wp;
+float h(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float n(vec2 p) {
+	vec2 i = floor(p); vec2 f = fract(p); f = f * f * (3.0 - 2.0 * f);
+	return mix(mix(h(i), h(i + vec2(1, 0)), f.x), mix(h(i + vec2(0, 1)), h(i + vec2(1, 1)), f.x), f.y);
+}
+void vertex() { wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xz; }
+float lum(vec2 uv) { return dot(texture(tex, uv).rgb, vec3(0.33)); }
+void fragment() {
+	// 10 × 5 u por cópia, centrada sob o tapete; espelhada para não emendar.
+	vec2 uv = (wp - vec2(0.0, -1.0)) / vec2(10.0, 5.0) + 0.5;
+	uv = abs(mod(uv + 1.0, 2.0) - 1.0);
+	vec3 c = texture(tex, uv).rgb;
+	// Veio fino ao longo das tábuas + manchas grandes: esconde a baixa resolução da textura.
+	float grain = n(vec2(wp.x * 3.0, wp.y * 60.0)) * 0.6 + n(vec2(wp.x * 9.0, wp.y * 160.0)) * 0.4;
+	float blot = n(wp * 0.9) * 0.6 + n(wp * 2.7) * 0.4;
+	c *= mix(0.82, 1.08, grain) * mix(0.75, 1.05, blot);
+	ALBEDO = c * vec3(0.78, 0.64, 0.54);
+	vec2 e = vec2(1.5 / 1080.0, 1.5 / 540.0);
+	float dx = lum(uv + vec2(e.x, 0.0)) - lum(uv - vec2(e.x, 0.0));
+	float dy = lum(uv + vec2(0.0, e.y)) - lum(uv - vec2(0.0, e.y));
+	NORMAL_MAP = normalize(vec3(-dx * 6.0, -dy * 6.0, 1.0)) * 0.5 + 0.5;
+	ROUGHNESS = mix(0.55, 0.85, grain);
+	SPECULAR = 0.35;
+}"""
+	var m := ShaderMaterial.new()
+	m.shader = sh
+	m.set_shader_parameter("tex", load("res://assets/table.jpg"))
+	return m
+
+# Tapete de jogo: tecido bordô quase preto, borda enrolada com costura dourada, zonas impressas
+# (cantos de moldura em tinta desbotada) e um selo de pentagrama apagado entre monstros e loja.
+func _mat_material() -> ShaderMaterial:
+	var zones := []  # [cx, cz, meia-largura, meia-altura]
+	var cw := Card3D.W / 2 + 0.06
+	var chh := Card3D.H / 2 + 0.06
+	for c in [Vector2(-1.65, -1.55), Vector2(-1.65, -0.3), Vector2(1.65, -0.3), Vector2(1.65, -1.55),
+			Vector2(-0.55, -1.55), Vector2(0.55, -1.55), Vector2(-0.55, -0.3), Vector2(0.55, -0.3),
+			Vector2(-1.65, 0.95), Vector2(1.65, -3.0)]:
+		zones.append([c.x, c.y, cw, chh])
+	zones.append([0.15, 0.95, 1.18, chh * 0.9])    # seus itens
+	zones.append([-0.15, -3.0, 1.18, chh * 0.9])   # itens da CPU
+	var zs := PackedStringArray()
+	for z in zones:
+		zs.append("vec4(%f, %f, %f, %f)" % z)
+	var sh := Shader.new()
+	sh.code = """shader_type spatial;
+const int NZ = %d;
+const vec4 Z[NZ] = vec4[NZ](%s);
+const vec2 CEN = vec2(0.0, -0.95);
+const vec2 HALF = vec2(2.375, 2.925);
+varying vec2 wp;
+float h(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float n(vec2 p) {
+	vec2 i = floor(p); vec2 f = fract(p); f = f * f * (3.0 - 2.0 * f);
+	return mix(mix(h(i), h(i + vec2(1, 0)), f.x), mix(h(i + vec2(0, 1)), h(i + vec2(1, 1)), f.x), f.y);
+}
+float box(vec2 p, vec2 b, float r) { vec2 q = abs(p) - b + r; return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r; }
+float seg(vec2 p, vec2 a, vec2 b) { vec2 pa = p - a, ba = b - a; return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0)); }
+void vertex() { wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xz; }
+void fragment() {
+	vec2 p = wp - CEN;
+	float aa = fwidth(p.x) * 1.5;
+	// Tecido: trama fina (some com a distância) + manchas de uso, mais claro no meio onde se joga.
+	float weave = (sin(wp.x * 420.0) * sin(wp.y * 420.0)) * (1.0 - smoothstep(0.004, 0.012, aa));
+	float mott = n(wp * 1.3) * 0.5 + n(wp * 4.0) * 0.3 + n(wp * 13.0) * 0.2;
+	vec3 base = vec3(0.07, 0.022, 0.02) * mix(0.8, 1.15, mott) * (1.0 + weave * 0.06);
+	base *= mix(1.12, 0.8, smoothstep(0.6, 1.0, length(p / HALF)));
+	float ink = 0.0;
+	// Zonas: moldura arredondada fraca + cantos marcados.
+	for (int i = 0; i < NZ; i++) {
+		vec2 q = p + CEN - Z[i].xy;
+		float d = box(q, Z[i].zw, 0.05);
+		float line = 1.0 - smoothstep(0.0, 0.006 + aa, abs(d));
+		vec2 cq = abs(q) - (Z[i].zw - 0.12);
+		float corner = step(0.0, cq.x) * step(0.0, cq.y);
+		ink = max(ink, line * mix(0.28, 0.85, corner));
+	}
+	// Selo apagado: círculo duplo + pentagrama entre monstros e loja.
+	vec2 s = wp - vec2(0.0, -0.93);
+	float r = length(s);
+	float sig = 1.0 - smoothstep(0.0, 0.007 + aa, abs(r - 0.36));
+	sig = max(sig, 1.0 - smoothstep(0.0, 0.005 + aa, abs(r - 0.33)));
+	for (int k = 0; k < 5; k++) {
+		float a0 = 6.2831853 * float(k) / 5.0 - 1.5707963;
+		float a1 = 6.2831853 * float(k + 2) / 5.0 - 1.5707963;
+		sig = max(sig, 1.0 - smoothstep(0.0, 0.005 + aa, seg(s, 0.33 * vec2(cos(a0), -sin(a0)), 0.33 * vec2(cos(a1), -sin(a1)))));
+	}
+	ink = max(ink, sig * 0.35);
+	vec3 col = mix(base, vec3(0.5, 0.33, 0.2), ink * 0.32 * mix(0.6, 1.0, mott));
+	// Borda enrolada (mais escura e com volume) e costura tracejada dourada.
+	float de = -box(p, HALF, 0.12);
+	float rim = 1.0 - smoothstep(0.0, 0.09, de);
+	col *= 1.0 - rim * 0.45;
+	float st = 1.0 - smoothstep(0.0, 0.009 + aa, abs(de - 0.13));
+	float dash = step(0.45, fract((abs(p.x) > HALF.x - 0.25 ? p.y : p.x) * 14.0));
+	col = mix(col, vec3(0.62, 0.45, 0.22), st * dash * 0.7);
+	ALBEDO = col;
+	ROUGHNESS = 0.95;
+	SPECULAR = 0.1;
+	NORMAL_MAP = normalize(vec3(weave * 0.08, weave * 0.08, 1.0)) * 0.5 + 0.5;
+}""" % [zones.size(), ", ".join(zs)]
+	var m := ShaderMaterial.new()
+	m.shader = sh
+	return m
+
+func _wax_mat() -> StandardMaterial3D:
+	var wax := StandardMaterial3D.new()
+	wax.albedo_color = Color(0.72, 0.64, 0.5)
+	wax.roughness = 0.45
+	wax.rim_enabled = true
+	wax.rim = 0.4
+	wax.rim_tint = 0.8
+	# Cera translúcida: deixa a luz "vazar" perto da chama.
+	wax.backlight_enabled = true
+	wax.backlight = Color(0.45, 0.22, 0.08)
+	return wax
+
+# Prato de ferro com `n` velas de alturas diferentes, poça de cera e pingos.
+func _candle_dish(pos: Vector3, n: int) -> void:
+	var dish := MeshInstance3D.new()
+	var dm := CylinderMesh.new()
+	dm.top_radius = 0.2 + 0.05 * n
+	dm.bottom_radius = 0.17 + 0.05 * n
+	dm.height = 0.035
+	dish.mesh = dm
+	var iron := StandardMaterial3D.new()
+	iron.albedo_color = Color(0.16, 0.13, 0.11)
+	iron.metallic = 0.8
+	iron.roughness = 0.45
+	dish.material_override = iron
+	dish.position = pos + Vector3(0, 0.017, 0)
+	add_child(dish)
+	var pool := MeshInstance3D.new()
+	var pmm := CylinderMesh.new()
+	pmm.top_radius = dm.top_radius * 0.8
+	pmm.bottom_radius = dm.top_radius * 0.82
+	pmm.height = 0.012
+	pool.mesh = pmm
+	pool.material_override = _wax_mat()
+	pool.position = pos + Vector3(0, 0.04, 0)
+	add_child(pool)
+	var offs := [Vector3.ZERO] if n == 1 else [Vector3(-0.09, 0, 0.04), Vector3(0.1, 0, -0.03), Vector3(0.0, 0, 0.12)]
+	for k in n:
+		_candle(pos + offs[k] + Vector3(0, 0.045, 0), [0.6, 0.38, 0.27][k] * randf_range(0.85, 1.1))
+
+func _candle(pos: Vector3, h: float) -> void:
+	var wax := _wax_mat()
+	var r := randf_range(0.065, 0.08)
 	var body := MeshInstance3D.new()
 	var cm := CylinderMesh.new()
-	cm.top_radius = 0.075
-	cm.bottom_radius = 0.085
+	cm.top_radius = r * 0.95
+	cm.bottom_radius = r
 	cm.height = h
+	cm.radial_segments = 20
 	body.mesh = cm
-	var wax := StandardMaterial3D.new()
-	wax.albedo_color = Color(0.9, 0.85, 0.72)
-	wax.roughness = 0.6
-	wax.subsurf_scatter_enabled = false
 	body.material_override = wax
 	body.position = pos + Vector3(0, h / 2, 0)
 	add_child(body)
+	# Borda derretida no topo + escorridos descendo pelo corpo.
+	var lip := MeshInstance3D.new()
+	var tm := TorusMesh.new()
+	tm.inner_radius = r * 0.7
+	tm.outer_radius = r * 1.02
+	tm.rings = 16
+	lip.mesh = tm
+	lip.material_override = wax
+	lip.position = pos + Vector3(0, h - 0.005, 0)
+	lip.scale = Vector3(1, 0.45, 1)
+	add_child(lip)
+	for k in randi_range(3, 5):
+		var a := randf() * TAU
+		var dl := randf_range(0.06, h * 0.7)
+		var drip := MeshInstance3D.new()
+		var cap := CapsuleMesh.new()
+		cap.radius = randf_range(0.009, 0.016)
+		cap.height = dl
+		drip.mesh = cap
+		drip.material_override = wax
+		drip.position = pos + Vector3(cos(a) * r * 0.96, h - dl / 2 + 0.01, sin(a) * r * 0.96)
+		add_child(drip)
+	var wick := MeshInstance3D.new()
+	var wm := CylinderMesh.new()
+	wm.top_radius = 0.004
+	wm.bottom_radius = 0.005
+	wm.height = 0.04
+	wick.mesh = wm
+	var wmat := StandardMaterial3D.new()
+	wmat.albedo_color = Color(0.05, 0.04, 0.03)
+	wick.material_override = wmat
+	wick.position = pos + Vector3(0, h + 0.015, 0)
+	add_child(wick)
+	# Chama: lágrima em shader (núcleo azul na base, corpo laranja, ponta que tremula) + halo.
 	var flame := MeshInstance3D.new()
-	var sm := SphereMesh.new()
-	sm.radius = 0.03
-	sm.height = 0.11
-	flame.mesh = sm
-	var fm := StandardMaterial3D.new()
-	fm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	fm.albedo_color = Color(1.0, 0.7, 0.3)
-	fm.emission_enabled = true
-	fm.emission = Color(1.0, 0.55, 0.2)
-	fm.emission_energy_multiplier = 6.0
+	var q := QuadMesh.new()
+	q.size = Vector2(0.13, 0.28)
+	flame.mesh = q
+	var fs := Shader.new()
+	fs.code = """shader_type spatial;
+render_mode unshaded, blend_add, depth_draw_never, cull_disabled;
+uniform float ph = 0.0;
+void vertex() {
+	// Billboard: a câmera olha de cima, então "para cima na tela" lê como chama de pé.
+	MODELVIEW_MATRIX = VIEW_MATRIX * mat4(INV_VIEW_MATRIX[0], INV_VIEW_MATRIX[1], INV_VIEW_MATRIX[2], MODEL_MATRIX[3]);
+	float t = TIME * 9.0 + ph;
+	VERTEX.x += (sin(t) * 0.6 + sin(t * 2.3) * 0.4) * 0.018 * smoothstep(-0.04, 0.14, VERTEX.y);
+}
+void fragment() {
+	vec2 uv = UV * 2.0 - 1.0;
+	float y = 1.0 - UV.y;
+	float w = mix(0.75, 0.0, pow(y, 1.3)) * (0.6 + 0.4 * smoothstep(0.0, 0.25, y));
+	float d = abs(uv.x) / max(w, 0.001);
+	float a = (1.0 - smoothstep(0.55, 1.0, d)) * smoothstep(0.0, 0.08, y) * (1.0 - smoothstep(0.85, 1.0, y));
+	vec3 core = vec3(0.35, 0.5, 1.0);
+	vec3 body = mix(vec3(1.0, 0.45, 0.08), vec3(1.0, 0.92, 0.6), 1.0 - d);
+	vec3 c = mix(core, body, smoothstep(0.05, 0.3, y));
+	ALBEDO = c * a * 3.2;
+}"""
+	var fm := ShaderMaterial.new()
+	fm.shader = fs
+	fm.set_shader_parameter("ph", randf() * 10.0)
 	flame.material_override = fm
-	flame.position = pos + Vector3(0, h + 0.06, 0)
+	flame.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	flame.position = pos + Vector3(0, h + 0.11, 0)
 	add_child(flame)
+	var halo := MeshInstance3D.new()
+	var hq := QuadMesh.new()
+	hq.size = Vector2(0.8, 0.8)
+	halo.mesh = hq
+	var hm := StandardMaterial3D.new()
+	hm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	hm.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
+	hm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	hm.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	hm.albedo_texture = soft_tex
+	hm.albedo_color = Color(1.0, 0.5, 0.18, 0.35)
+	hm.no_depth_test = false
+	halo.material_override = hm
+	halo.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	halo.position = pos + Vector3(0, h + 0.1, 0)
+	add_child(halo)
 	var l := OmniLight3D.new()
 	l.light_color = Color(1.0, 0.6, 0.3)
 	l.omni_range = 2.8
@@ -430,7 +686,7 @@ func _candle(pos: Vector3) -> void:
 	flames.append([flame, l, randf() * 10.0])
 	# Brasas subindo da chama
 	var em := CPUParticles3D.new()
-	em.amount = 6
+	em.amount = 5
 	em.lifetime = 1.6
 	em.preprocess = 2.0
 	em.direction = Vector3.UP
@@ -444,13 +700,37 @@ func _candle(pos: Vector3) -> void:
 	em.color_ramp = _fade_ramp()
 	em.mesh = _fx_quad(true)
 	em.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	em.position = pos + Vector3(0, h + 0.1, 0)
+	em.position = pos + Vector3(0, h + 0.12, 0)
 	add_child(em)
+
+# Moedas largadas: pilha torta (n > 2) ou soltas, douradas e gastas.
+func _coin_pile(pos: Vector3, n: int) -> void:
+	var gold := StandardMaterial3D.new()
+	gold.albedo_color = Color(0.78, 0.55, 0.18)
+	gold.metallic = 0.9
+	gold.roughness = 0.38
+	var cm := CylinderMesh.new()
+	cm.top_radius = 0.075
+	cm.bottom_radius = 0.075
+	cm.height = 0.014
+	cm.radial_segments = 20
+	for k in n:
+		var c := MeshInstance3D.new()
+		c.mesh = cm
+		c.material_override = gold
+		if n > 2 and k < 3:
+			c.position = pos + Vector3(randf_range(-0.012, 0.012), 0.008 + k * 0.0145, randf_range(-0.012, 0.012))
+			c.rotation = Vector3(randf_range(-0.04, 0.04), randf() * TAU, randf_range(-0.04, 0.04))
+		else:
+			var a := randf() * TAU
+			c.position = pos + Vector3(cos(a), 0, sin(a)) * randf_range(0.12, 0.2) + Vector3(0, 0.008, 0)
+			c.rotation = Vector3(randf_range(-0.05, 0.05), randf() * TAU, 0)
+		add_child(c)
 
 func _label3d(txt: String, sz: int, col: Color) -> Label3D:
 	var l := Label3D.new()
 	l.text = txt
-	l.font = font_b
+	l.font = font_ui
 	l.font_size = sz
 	l.pixel_size = 0.0035
 	l.modulate = col
@@ -510,6 +790,12 @@ func _relayout_slot_labels() -> void:
 	for i in slot_labels.size():
 		(slot_labels[i] as Label3D).position = Vector3((i - (n - 1) / 2.0) * 1.1, 0.002, -1.55)
 
+# Salas (Requiem): cartas horizontais numa fileira entre os monstros e os itens do oponente.
+func _room_xf(i: int) -> Transform3D:
+	var n: int = max(rooms.size(), 1)
+	var x: float = (i - (n - 1) / 2.0) * 0.95
+	return _flat(Vector3(x, 0.01, -2.33), PI / 2).scaled_local(Vector3.ONE * 0.8)
+
 func _stack_xf(i: int) -> Transform3D:
 	var pos := Vector3(-0.35 + i * 0.22, 1.25 + i * 0.03, 0.15 + i * 0.03)
 	var b := Basis.looking_at(pos - cam.position).scaled(Vector3.ONE * 0.85)
@@ -529,27 +815,41 @@ func _hand_xf(i: int, n: int, sel: bool) -> Transform3D:
 	return Transform3D(Basis(Vector3.BACK, -a).scaled(Vector3.ONE * sc), pos)
 
 func _opp_hand_xf(i: int, n: int) -> Transform3D:
-	var spread: float = min(0.14, 0.7 / max(n, 1))
+	var r := 3.0
+	var spread: float = min(0.2, 1.2 / max(n - 1, 1))
 	var a := (i - (n - 1) / 2.0) * spread
-	var r := 2.5
 	var pos := Vector3(sin(a) * r, cos(a) * r - r, -i * 0.006)
-	return Transform3D(Basis(Vector3.BACK, -a).scaled(Vector3.ONE * 0.55), pos)
+	return Transform3D(Basis(Vector3.BACK, -a).scaled(Vector3.ONE * 1.15), pos)
 
 # =====================================================================
 # HUD 2D
 # =====================================================================
-func _panel_style(border: Color, alpha := 0.82) -> StyleBoxFlat:
-	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color(0.045, 0.03, 0.025, alpha)
-	sb.border_color = border
-	sb.set_border_width_all(1)
-	sb.set_corner_radius_all(4)
-	sb.content_margin_left = 14
-	sb.content_margin_right = 14
-	sb.content_margin_top = 8
-	sb.content_margin_bottom = 8
-	sb.shadow_color = Color(0, 0, 0, 0.5)
-	sb.shadow_size = 8
+# Mesmo vocabulário visual do menu/seleção: papel do TBOI (recortes de seedentry.png), tinta e Upheaval.
+const HUD := "res://assets/ui/hud/"
+const INK := Color8(55, 43, 44)
+const INK_HOT := Color8(140, 32, 44)
+const INK_SOFT := Color8(110, 88, 90)
+const INK_BLUE := Color8(42, 72, 120)
+const INK_GREEN := Color8(40, 96, 52)
+const PAPER := Color8(233, 218, 223)
+
+# Papel rasgado como nine-patch: "paper" = folha grande (2×, inspeção/faixa); "paper_s" = a mesma folha 1×
+# (placas, botões, pilha); "scrap" = retalho pardo 1× (botões secundários, avisos). `pad` soma à borda rasgada.
+const PAPER_M := {"paper": [32, 40, 24, 36], "paper_s": [15, 20, 11, 18], "scrap": [9, 12, 7, 11]}
+
+func _paper(kind := "paper_s", tint := Color.WHITE, pad := Vector2(6, 2)) -> StyleBoxTexture:
+	var sb := StyleBoxTexture.new()
+	sb.texture = load(HUD + kind + ".png")
+	var m: Array = PAPER_M[kind]
+	sb.texture_margin_left = m[0]
+	sb.texture_margin_right = m[1]
+	sb.texture_margin_top = m[2]
+	sb.texture_margin_bottom = m[3]
+	sb.content_margin_left = m[0] + pad.x
+	sb.content_margin_right = m[1] + pad.x - 4
+	sb.content_margin_top = m[2] + pad.y - 3
+	sb.content_margin_bottom = m[3] + pad.y - 5
+	sb.modulate_color = tint
 	return sb
 
 func _lbl(txt: String, sz: int, col := Color(0.93, 0.88, 0.8), bold := false) -> Label:
@@ -560,26 +860,111 @@ func _lbl(txt: String, sz: int, col := Color(0.93, 0.88, 0.8), bold := false) ->
 	l.add_theme_color_override("font_color", col)
 	return l
 
+# Rótulo na fonte do menu (Upheaval); `outline` > 0 para texto solto sobre a mesa.
+func _ulbl(txt: String, sz: int, col := INK, outline := 0) -> Label:
+	var l := Label.new()
+	l.text = txt
+	l.add_theme_font_override("font", font_ui)
+	l.add_theme_font_size_override("font_size", sz)
+	l.add_theme_color_override("font_color", col)
+	if outline > 0:
+		l.add_theme_constant_override("outline_size", outline)
+		l.add_theme_color_override("font_outline_color", Color(0.03, 0.015, 0.01, 0.9))
+	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	return l
+
+func _icon(file: String, sz: float) -> TextureRect:
+	var t := TextureRect.new()
+	t.texture = load(HUD + file)
+	t.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	t.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	t.custom_minimum_size = Vector2(sz, sz)
+	t.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	return t
+
+# Ícones embutidos em RichTextLabel: coração, moeda, espada, caveira e faces do dado vermelho.
+func _ic(name: String, sz := 20) -> String:
+	match name:
+		"sword":
+			return "[img=%dx%d]res://assets/ui/select/sword.png[/img]" % [sz, sz]
+	return "[img=%dx%d]%s%s.png[/img]" % [sz, sz, HUD, name]
+
+func _ic_die(v: int, sz := 20) -> String:
+	return "[img=%dx%d region=%d,0,128,128]%sdie.png[/img]" % [sz, sz, (clampi(v, 1, 6) - 1) * 128, HUD]
+
+# Carta em 2D com os mesmos cantos arredondados (e espessura sugerida) da Card3D.
+var _card_mat_cache: ShaderMaterial
+func _card_mat() -> ShaderMaterial:
+	if _card_mat_cache:
+		return _card_mat_cache
+	var sh := Shader.new()
+	sh.code = """shader_type canvas_item;
+uniform vec2 rad = vec2(%f, %f);
+uniform float shine = -1.0;
+void fragment() {
+	vec2 q = abs(UV - 0.5) - (vec2(0.5) - rad);
+	float d = length(max(q / rad, 0.0)) - 1.0;
+	float aa = fwidth(d) * 1.2;
+	vec4 c = COLOR;  // já é textura × modulate
+	// Borda fina mais escura + leve verniz no alto: lê como cartão, não como png colado.
+	float rim = min(min(UV.x, 1.0 - UV.x) / rad.x, min(UV.y, 1.0 - UV.y) / rad.y);
+	float e = min(rim, -d);
+	c.rgb *= mix(0.7, 1.0, smoothstep(0.2, 0.6, e));
+	// Fio claro de papelão na borda, como a espessura da Card3D no campo.
+	c.rgb = mix(c.rgb, vec3(0.86, 0.82, 0.74) * mix(0.8, 1.0, UV.y), 1.0 - smoothstep(0.17, 0.23, e));
+	c.rgb += vec3(1.0, 0.95, 0.85) * 0.05 * smoothstep(0.55, 0.0, UV.y);
+	float diag = (UV.x + UV.y) * 0.5;
+	c.rgb += vec3(1.0, 0.92, 0.75) * 0.5 * (1.0 - smoothstep(0.0, 0.07, abs(diag - shine)));
+	c.a *= 1.0 - smoothstep(-aa, aa, d);
+	COLOR = c;
+}""" % [Card3D.RADIUS / Card3D.W, Card3D.RADIUS / Card3D.H]
+	_card_mat_cache = ShaderMaterial.new()
+	_card_mat_cache.shader = sh
+	return _card_mat_cache
+
+func _rich(sz: int, col := INK, f: Font = null) -> RichTextLabel:
+	var r := RichTextLabel.new()
+	r.bbcode_enabled = true
+	r.fit_content = true
+	r.scroll_active = false
+	r.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	r.add_theme_font_override("normal_font", f if f else font_r)
+	r.add_theme_font_override("bold_font", f if f else font_b)
+	r.add_theme_font_size_override("normal_font_size", sz)
+	r.add_theme_font_size_override("bold_font_size", sz)
+	r.add_theme_color_override("default_color", col)
+	r.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	return r
+
+# Cores dos avisos foram pensadas para fundo escuro; no papel viram tinta do mesmo "sentido".
+func _ink_of(c: Color) -> Color:
+	if c.r > c.g + 0.25 and c.r > c.b + 0.2:
+		return INK_HOT
+	if c.b > c.r + 0.1:
+		return INK_BLUE
+	if c.g > c.r + 0.1:
+		return INK_GREEN
+	return INK
+
 func _btn(txt: String, cb: Callable, primary := true) -> Button:
 	var b := Button.new()
 	b.text = txt
-	b.add_theme_font_override("font", font_b)
-	b.add_theme_font_size_override("font_size", 17)
-	b.custom_minimum_size = Vector2(150, 50)
-	var n := _panel_style(GOLD if primary else Color(0.5, 0.42, 0.32), 0.92)
-	n.bg_color = Color(0.32, 0.12, 0.08, 0.95) if primary else Color(0.08, 0.06, 0.05, 0.95)
-	var h := n.duplicate()
-	h.bg_color = n.bg_color.lightened(0.15)
-	var dis := n.duplicate()
-	dis.bg_color = Color(0.1, 0.09, 0.08, 0.7)
-	dis.border_color = Color(0.3, 0.27, 0.22)
+	b.add_theme_font_override("font", font_ui)
+	b.add_theme_font_size_override("font_size", 22)
+	b.custom_minimum_size = Vector2(150, 52)
+	var kind := "paper_s" if primary else "scrap"
+	var n := _paper(kind)
+	var h := _paper(kind, Color(1.0, 0.94, 0.9))
+	var pr := _paper(kind, Color(0.86, 0.78, 0.76))
+	var dis := _paper(kind, Color(0.7, 0.66, 0.66, 0.8))
 	b.add_theme_stylebox_override("normal", n)
 	b.add_theme_stylebox_override("hover", h)
-	b.add_theme_stylebox_override("pressed", h)
+	b.add_theme_stylebox_override("pressed", pr)
 	b.add_theme_stylebox_override("disabled", dis)
 	b.add_theme_stylebox_override("focus", StyleBoxEmpty.new())
-	b.add_theme_color_override("font_color", Color(0.98, 0.9, 0.75))
-	b.add_theme_color_override("font_disabled_color", Color(0.45, 0.42, 0.38))
+	for st in ["font_color", "font_hover_color", "font_pressed_color", "font_focus_color"]:
+		b.add_theme_color_override(st, INK_HOT if primary else INK)
+	b.add_theme_color_override("font_disabled_color", Color8(95, 80, 82))
 	b.pressed.connect(Sfx.play.bind("ui_click"))
 	b.pressed.connect(cb)
 	# Resposta tátil: afunda ao tocar, volta com mola.
@@ -590,7 +975,7 @@ func _btn(txt: String, cb: Callable, primary := true) -> Button:
 		b.create_tween().tween_property(b, "scale", Vector2.ONE, 0.25).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT))
 	return b
 
-# Pulso de atenção num botão (prioridade, rolar ataque).
+# Pulso de atenção num botão (prioridade, rolar ataque): o papel "esquenta" em vermelho.
 func _set_pulse(b: Button, on: bool) -> void:
 	var tw: Tween = b.get_meta("pulse_tw") if b.has_meta("pulse_tw") else null
 	if on == (tw != null and tw.is_valid()):
@@ -601,9 +986,31 @@ func _set_pulse(b: Button, on: bool) -> void:
 		b.self_modulate = Color.WHITE
 	if on:
 		tw = b.create_tween().set_loops()
-		tw.tween_property(b, "self_modulate", Color(1.35, 1.2, 0.95), 0.45).set_trans(Tween.TRANS_SINE)
+		tw.tween_property(b, "self_modulate", Color(1.0, 0.72, 0.68), 0.45).set_trans(Tween.TRANS_SINE)
 		tw.tween_property(b, "self_modulate", Color.WHITE, 0.45).set_trans(Tween.TRANS_SINE)
 		b.set_meta("pulse_tw", tw)
+
+# Almas em direção às 4: bolinhas cheias/vazias leem mais rápido que "2/4".
+class SoulPips extends Control:
+	var n := 0:
+		set(v):
+			n = v
+			queue_redraw()
+	var total := 4
+
+	func _init() -> void:
+		custom_minimum_size = Vector2(4 * 14 + 2, 22)
+		mouse_filter = MOUSE_FILTER_IGNORE
+
+	func _draw() -> void:
+		for k in total:
+			var c := Vector2(7 + k * 14, size.y / 2)
+			if k < n:
+				draw_circle(c, 6.5, Color8(55, 43, 44))
+				draw_circle(c, 4.8, Color8(150, 200, 240))
+				draw_circle(c + Vector2(-1.5, -1.5), 1.8, Color(1, 1, 1, 0.85))
+			else:
+				draw_circle(c, 3.0, Color8(110, 88, 90, 110))
 
 func _build_hud() -> void:
 	var post := CanvasLayer.new()
@@ -650,195 +1057,254 @@ void fragment(){
 	_apply_safe_area()
 	get_viewport().size_changed.connect(_apply_safe_area)
 
-	for active_style in [false, true]:
-		var st := _panel_style(GOLD if active_style else Color(0.35, 0.3, 0.25))
-		if active_style:
-			st.shadow_color = Color(0.86, 0.6, 0.25, 0.35)
-			st.shadow_size = 12
-			st.set_border_width_all(2)
-		plate_styles.append(st)
-
-	# Placas dos jogadores
+	# Placas dos jogadores: bilhetes de papel; a tachinha marca de quem é o turno.
 	var top := HBoxContainer.new()
 	top.set_anchors_preset(Control.PRESET_TOP_WIDE)
-	top.offset_left = 12
-	top.offset_right = -12
-	top.offset_top = 12
-	top.add_theme_constant_override("separation", 10)
+	top.offset_left = 8
+	top.offset_right = -62
+	top.offset_top = 8
+	top.add_theme_constant_override("separation", 6)
 	top.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(top)
 	for i in 2:
 		var pc := PanelContainer.new()
 		pc.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		pc.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		pc.add_theme_stylebox_override("panel", _paper("paper_s", Color.WHITE, Vector2(2, 0)))
 		var v := VBoxContainer.new()
-		v.add_theme_constant_override("separation", 0)
+		v.add_theme_constant_override("separation", 2)
 		pc.add_child(v)
-		var name_l := _lbl("", 13, GOLD, true)
-		var stats_l := _lbl("", 19, Color(0.95, 0.9, 0.82), true)
-		v.add_child(name_l)
-		v.add_child(stats_l)
-		if i == 1:
-			name_l.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-			stats_l.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+		var head := HBoxContainer.new()
+		head.add_theme_constant_override("separation", 4)
+		var name_l := _ulbl("", 17, INK_SOFT)
+		name_l.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		name_l.clip_text = true
+		name_l.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+		var skull := _icon("skull.png", 18)
+		skull.visible = false
+		head.add_child(name_l)
+		head.add_child(skull)
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 3)
+		var hp_l := _ulbl("", 24, INK)
+		var coin_l := _ulbl("", 24, INK)
+		var souls := SoulPips.new()
+		row.add_child(_icon("heart.png", 22))
+		row.add_child(hp_l)
+		row.add_child(_gap(8))
+		row.add_child(_icon("coin.png", 21))
+		row.add_child(coin_l)
+		var sp := Control.new()
+		sp.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		sp.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		row.add_child(sp)
+		row.add_child(souls)
+		v.add_child(head)
+		v.add_child(row)
+		var tack := Sel.Tack.new()
+		tack.position = Vector2(0, 7)
+		tack.scale = Vector2(0.7, 0.7)
+		tack.visible = false
+		pc.add_child(tack)
 		top.add_child(pc)
-		plates.append([pc, name_l, stats_l])
+		plates.append({"pc": pc, "name": name_l, "hp": hp_l, "coin": coin_l, "souls": souls, "skull": skull, "row": row, "tack": tack})
+	# Menu de pausa (antes não havia como sair da partida sem fechar o jogo).
+	var menu_b := _btn("II", _open_pause, false)
+	menu_b.custom_minimum_size = Vector2(50, 50)
+	menu_b.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	menu_b.offset_left = -58
+	menu_b.offset_right = -6
+	menu_b.offset_top = 14
+	menu_b.offset_bottom = 64
+	root.add_child(menu_b)
 
-	phase_lbl = _lbl("", 14, Color(0.9, 0.8, 0.6), true)
-	phase_lbl.set_anchors_preset(Control.PRESET_TOP_WIDE)
-	phase_lbl.offset_top = 86
-	phase_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	phase_lbl.add_theme_constant_override("outline_size", 6)
-	phase_lbl.add_theme_color_override("font_outline_color", Color.BLACK)
-	root.add_child(phase_lbl)
-
-	# Feed de mensagens: até 3 linhas empilhadas, cada uma some sozinha (antes uma nova apagava a outra).
+	# Feed de mensagens: retalhos de papel sob a faixa de turno, até 3, cada um some sozinho.
 	feed = VBoxContainer.new()
-	feed.set_anchors_preset(Control.PRESET_CENTER)
-	feed.offset_left = -200
-	feed.offset_right = 200
-	feed.offset_top = -150
-	feed.offset_bottom = 30
-	feed.alignment = BoxContainer.ALIGNMENT_END
-	feed.add_theme_constant_override("separation", 6)
+	feed.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	feed.offset_left = -210
+	feed.offset_right = 210
+	feed.offset_top = 80
+	feed.offset_bottom = 170
+	feed.alignment = BoxContainer.ALIGNMENT_BEGIN
+	feed.add_theme_constant_override("separation", 2)
 	feed.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(feed)
 
-	# Faixa de turno que atravessa a tela.
+	# Faixa de turno: tira de papel que atravessa a tela.
 	banner = Control.new()
 	banner.set_anchors_preset(Control.PRESET_FULL_RECT)
 	banner.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	banner.visible = false
 	root.add_child(banner)
-	banner_band = ColorRect.new()
-	banner_band.color = Color(0.06, 0.025, 0.018, 0.88)
+	banner_band = Panel.new()
+	banner_band.add_theme_stylebox_override("panel", _paper("paper"))
 	banner_band.anchor_left = 0
 	banner_band.anchor_right = 1
 	banner_band.anchor_top = 0.43
 	banner_band.anchor_bottom = 0.43
-	banner_band.offset_top = -40
-	banner_band.offset_bottom = 40
+	banner_band.offset_left = -14
+	banner_band.offset_right = 14
+	banner_band.offset_top = -44
+	banner_band.offset_bottom = 44
 	banner_band.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	banner.add_child(banner_band)
-	for y in [0.0, 1.0]:
-		var line := ColorRect.new()
-		line.color = Color(GOLD, 0.8)
-		line.anchor_right = 1
-		line.anchor_top = y
-		line.anchor_bottom = y
-		line.offset_top = -1 if y > 0 else 0
-		line.offset_bottom = 0 if y > 0 else 1
-		line.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		banner_band.add_child(line)
-	banner_lbl = _lbl("", 30, Color(1, 0.9, 0.7), true)
+	banner_lbl = _ulbl("", 40, INK_HOT)
 	banner_lbl.set_anchors_preset(Control.PRESET_FULL_RECT)
 	banner_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	banner_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	banner_lbl.add_theme_constant_override("outline_size", 10)
-	banner_lbl.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.85))
 	banner_band.add_child(banner_lbl)
 
-	# Pilha
+	# Pilha: bilhete com a ordem de resolução (topo primeiro) e o PASSAR.
 	stack_panel = PanelContainer.new()
-	stack_panel.add_theme_stylebox_override("panel", _panel_style(GOLD))
+	stack_panel.add_theme_stylebox_override("panel", _paper("paper_s", Color.WHITE, Vector2(8, 4)))
 	stack_panel.set_anchors_preset(Control.PRESET_CENTER_TOP)
-	stack_panel.offset_left = -170
-	stack_panel.offset_right = 170
-	stack_panel.offset_top = 140
+	stack_panel.offset_left = -180
+	stack_panel.offset_right = 180
+	stack_panel.offset_top = 132
 	stack_panel.visible = false
 	root.add_child(stack_panel)
 	var sv := VBoxContainer.new()
+	sv.add_theme_constant_override("separation", 4)
 	stack_panel.add_child(sv)
-	sv.add_child(_lbl("PILHA", 12, GOLD, true))
-	stack_list = _lbl("", 14)
-	stack_list.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	stack_list.custom_minimum_size = Vector2(300, 0)
+	sv.add_child(_ulbl("PILHA · resolve de cima para baixo", 16, INK_SOFT))
+	stack_list = _rich(16)
+	stack_list.custom_minimum_size = Vector2(316, 0)
 	sv.add_child(stack_list)
 	pass_btn = _btn("PASSAR", _on_pass)
+	pass_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 	sv.add_child(pass_btn)
 
-	hint_lbl = _lbl("", 14, Color(0.85, 0.78, 0.66))
-	hint_lbl.set_anchors_preset(Control.PRESET_CENTER_TOP)
-	hint_lbl.offset_left = -260
-	hint_lbl.offset_right = 260
-	hint_lbl.offset_top = 112
+	hint_lbl = _ulbl("", 18, PAPER, 6)
+	hint_lbl.anchor_left = 0
+	hint_lbl.anchor_right = 1
+	hint_lbl.anchor_top = 0.69
+	hint_lbl.anchor_bottom = 0.69
+	hint_lbl.offset_left = 12
+	hint_lbl.offset_right = -12
+	hint_lbl.grow_vertical = Control.GROW_DIRECTION_BEGIN
 	hint_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	hint_lbl.add_theme_constant_override("outline_size", 6)
-	hint_lbl.add_theme_color_override("font_outline_color", Color.BLACK)
-	hint_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hint_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	root.add_child(hint_lbl)
 
 	# Botão estreito de duas linhas no canto: a mão (deslocada à esquerda) não fica embaixo dele.
 	action_btn = _btn("ENCERRAR\nTURNO", _on_action)
-	action_btn.add_theme_font_size_override("font_size", 15)
-	action_btn.custom_minimum_size = Vector2(112, 62)
+	action_btn.add_theme_font_size_override("font_size", 21)
+	action_btn.custom_minimum_size = Vector2(118, 70)
 	action_btn.set_anchors_preset(Control.PRESET_BOTTOM_RIGHT)
-	action_btn.offset_left = -122
-	action_btn.offset_right = -10
-	action_btn.offset_top = -74
+	action_btn.offset_left = -126
+	action_btn.offset_right = -8
+	action_btn.offset_top = -82
 	action_btn.offset_bottom = -12
 	action_btn.visible = false
 	root.add_child(action_btn)
 
 	# Prompt de alvo
 	prompt_panel = PanelContainer.new()
-	prompt_panel.add_theme_stylebox_override("panel", _panel_style(GOLD))
+	prompt_panel.add_theme_stylebox_override("panel", _paper("paper_s", Color.WHITE, Vector2(6, 2)))
 	prompt_panel.set_anchors_preset(Control.PRESET_CENTER_TOP)
-	prompt_panel.offset_left = -200
-	prompt_panel.offset_right = 200
-	prompt_panel.offset_top = 112
+	prompt_panel.offset_left = -220
+	prompt_panel.offset_right = 220
+	prompt_panel.offset_top = 104
 	prompt_panel.visible = false
 	root.add_child(prompt_panel)
 	var ph := HBoxContainer.new()
+	ph.add_theme_constant_override("separation", 8)
 	prompt_panel.add_child(ph)
-	prompt_lbl = _lbl("", 16, Color(1, 0.92, 0.75), true)
+	prompt_lbl = _ulbl("", 20, INK_HOT)
 	prompt_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	prompt_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	prompt_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	ph.add_child(prompt_lbl)
 	var cb := _btn("CANCELAR", func(): target_chosen.emit(null), false)
-	cb.custom_minimum_size = Vector2(110, 40)
+	cb.custom_minimum_size = Vector2(120, 48)
 	ph.add_child(cb)
 
-	# Inspeção de carta
+	# Inspeção de carta: carta grande, título na fonte do menu, texto num bilhete com ícones.
 	inspect = ColorRect.new()
 	(inspect as ColorRect).color = Color(0, 0, 0, 0.78)
 	inspect.set_anchors_preset(Control.PRESET_FULL_RECT)
 	inspect.visible = false
 	inspect.gui_input.connect(func(e):
-		if e is InputEventMouseButton and e.pressed:
+		if e is InputEventMouseButton and e.pressed and not insp_forced:
 			_close_inspect())
 	root.add_child(inspect)
-	var iv := VBoxContainer.new()
-	iv.set_anchors_preset(Control.PRESET_FULL_RECT)
-	iv.alignment = BoxContainer.ALIGNMENT_CENTER
-	iv.add_theme_constant_override("separation", 12)
-	iv.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	inspect.add_child(iv)
+	insp_box = VBoxContainer.new()
+	insp_box.set_anchors_preset(Control.PRESET_FULL_RECT)
+	insp_box.offset_left = 16
+	insp_box.offset_right = -16
+	insp_box.alignment = BoxContainer.ALIGNMENT_CENTER
+	insp_box.add_theme_constant_override("separation", 10)
+	insp_box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	inspect.add_child(insp_box)
 	insp_tex = TextureRect.new()
-	insp_tex.custom_minimum_size = Vector2(340, 464)
+	insp_tex.material = _card_mat().duplicate()
+	# Sombra projetada atrás da carta (a carta "flutua" sobre a mesa escurecida).
+	var shadow := Panel.new()
+	var ssb := StyleBoxFlat.new()
+	ssb.bg_color = Color(0, 0, 0, 0.55)
+	ssb.set_corner_radius_all(int(Card3D.RADIUS / Card3D.W * 360))
+	ssb.shadow_color = Color(0, 0, 0, 0.55)
+	ssb.shadow_size = 22
+	ssb.shadow_offset = Vector2(8, 14)
+	shadow.add_theme_stylebox_override("panel", ssb)
+	shadow.set_anchors_preset(Control.PRESET_FULL_RECT)
+	shadow.offset_left = 4
+	shadow.offset_right = -4
+	shadow.offset_top = 4
+	shadow.offset_bottom = -4
+	shadow.show_behind_parent = true
+	shadow.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	insp_tex.add_child(shadow)
+	insp_tex.custom_minimum_size = Vector2(360, 492)
 	insp_tex.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	insp_tex.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	insp_tex.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	iv.add_child(insp_tex)
-	insp_title = _lbl("", 22, GOLD, true)
+	insp_box.add_child(insp_tex)
+	insp_title = _ulbl("", 32, PAPER, 8)
 	insp_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	iv.add_child(insp_title)
-	insp_text = _lbl("", 16)
-	insp_text.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	insp_text.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	insp_text.custom_minimum_size = Vector2(460, 0)
-	insp_text.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
-	iv.add_child(insp_text)
+	insp_title.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	insp_box.add_child(insp_title)
+	insp_note = PanelContainer.new()
+	insp_note.add_theme_stylebox_override("panel", _paper("paper", Color.WHITE, Vector2(4, 0)))
+	insp_note.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	insp_note.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	insp_box.add_child(insp_note)
+	insp_text = _rich(21, INK, font_ui)
+	insp_text.add_theme_constant_override("line_separation", 2)
+	insp_text.custom_minimum_size = Vector2(420, 0)
+	insp_note.add_child(insp_text)
 	insp_btns = HBoxContainer.new()
 	insp_btns.alignment = BoxContainer.ALIGNMENT_CENTER
-	insp_btns.add_theme_constant_override("separation", 12)
-	iv.add_child(insp_btns)
+	insp_btns.add_theme_constant_override("separation", 10)
+	insp_box.add_child(insp_btns)
 
 	overlay = ColorRect.new()
 	(overlay as ColorRect).color = Color(0.02, 0.012, 0.01, 0.94)
 	overlay.set_anchors_preset(Control.PRESET_FULL_RECT)
 	overlay.visible = false
 	root.add_child(overlay)
+
+func _gap(w: float) -> Control:
+	var c := Control.new()
+	c.custom_minimum_size = Vector2(w, 0)
+	c.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	return c
+
+func _open_pause() -> void:
+	if game_over or overlay.visible:
+		return
+	if inspect.visible and insp_forced:
+		return
+	var vb := VBoxContainer.new()
+	vb.alignment = BoxContainer.ALIGNMENT_CENTER
+	vb.add_theme_constant_override("separation", 10)
+	for o in [["CONTINUAR", _close_inspect, true], ["DESISTIR E IR AO MENU", _to_menu, false]]:
+		var b := _btn(o[0], o[1], o[2])
+		b.custom_minimum_size = Vector2(300, 56)
+		b.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+		vb.add_child(b)
+	_open_custom_panel("PAUSA", vb)
+	insp_forced = false
 
 func _apply_safe_area() -> void:
 	# Notch / barra de gestos no celular: afasta o HUD das bordas inseguras.
@@ -859,37 +1325,39 @@ func _toast(msg: String, col := Color(1, 0.93, 0.8)) -> void:
 	if autoplay:
 		print("[log] ", msg)  # log legível das partidas headless
 	var pc := PanelContainer.new()
-	pc.add_theme_stylebox_override("panel", _panel_style(Color(0.86, 0.68, 0.38, 0.45), 0.86))
+	pc.add_theme_stylebox_override("panel", _paper("scrap", Color.WHITE, Vector2(8, 2)))
 	pc.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	pc.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
-	var l := _lbl(msg, 16, col, true)
+	var l := _ulbl(msg, 19, _ink_of(col))
 	l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	if msg.length() > 38:
+	if msg.length() > 30:
 		# Só quebra linha com largura definida; num container encolhido o autowrap vira uma letra por linha.
 		l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 		l.custom_minimum_size.x = 360
 	pc.add_child(l)
 	feed.add_child(pc)
-	while feed.get_child_count() > 3:
+	while feed.get_child_count() > 2:
 		var old := feed.get_child(0)
 		feed.remove_child(old)
 		old.queue_free()
 	pc.modulate.a = 0
 	pc.scale = Vector2(0.8, 0.8)
 	var t := pc.create_tween()
-	t.tween_callback(func(): pc.pivot_offset = pc.size / 2)
+	t.tween_callback(func():
+		pc.pivot_offset = pc.size / 2
+		pc.rotation = randf_range(-0.025, 0.025))
 	t.tween_property(pc, "modulate:a", 1.0, 0.12)
 	t.parallel().tween_property(pc, "scale", Vector2.ONE, 0.25).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-	t.tween_interval(1.7)
+	t.tween_interval(2.2)
 	t.tween_property(pc, "modulate:a", 0.0, 0.35)
 	t.tween_callback(pc.queue_free)
 
 func _banner(msg: String, col := Color(1, 0.9, 0.7)) -> void:
 	banner.visible = true
 	banner_lbl.text = msg
-	banner_lbl.add_theme_color_override("font_color", col)
+	banner_lbl.add_theme_color_override("font_color", _ink_of(col))
 	var w := get_viewport().get_visible_rect().size.x
-	banner_band.pivot_offset = Vector2(w / 2, 40)
+	banner_band.pivot_offset = Vector2(w / 2, 44)
 	banner_band.scale = Vector2(1, 0)
 	banner_lbl.position.x = -w
 	var t := banner.create_tween()
@@ -905,28 +1373,38 @@ func _ui() -> void:
 		return
 	for i in 2:
 		var p: Dictionary = players[i]
-		var pl: Array = plates[i]
-		var pc: PanelContainer = pl[0]
-		pc.add_theme_stylebox_override("panel", plate_styles[1 if active == i else 0])
-		(pl[1] as Label).text = ("VOCÊ · " if i == 0 else "CPU · ") + p.name.to_upper() + ("  ☠" if p.dead else "")
-		var stats_l: Label = pl[2]
-		stats_l.text = "♥ %d/%d   ¢ %d   ✦ %d/%d" % [max(p.hp, 0), _max_hp(p), p.coins, p.soul_n, D.SOULS_TO_WIN]
-		_plate_feedback(i, stats_l, [max(p.hp, 0), p.coins, p.soul_n])
+		var pl: Dictionary = plates[i]
+		var mine: bool = active == i and not game_over
+		(pl.pc as Control).self_modulate = Color.WHITE if mine else Color(0.78, 0.74, 0.74)
+		(pl.tack as Control).visible = mine
+		(pl.tack as Control).position.x = (pl.pc as Control).size.x - 30
+		(pl.name as Label).text = ("VOCÊ · " if i == 0 else "CPU · ") + p.name.to_upper()
+		(pl.name as Label).add_theme_color_override("font_color", INK_HOT if mine else INK_SOFT)
+		(pl.skull as Control).visible = p.dead
+		(pl.hp as Label).text = "%d/%d" % [max(p.hp, 0), _max_hp(p)]
+		(pl.hp as Label).add_theme_color_override("font_color", INK_HOT if p.hp <= 1 else INK)
+		(pl.coin as Label).text = str(p.coins)
+		(pl.souls as SoulPips).total = D.SOULS_TO_WIN
+		(pl.souls as SoulPips).n = p.soul_n
+		_plate_feedback(i, pl.row, [max(p.hp, 0), p.coins, p.soul_n])
 	var me: Dictionary = players[0]
 	var danger: bool = me.hp == 1 and not me.dead and not game_over
 	if danger != danger_on:
 		danger_on = danger
 		var from: float = vig_mat.get_shader_parameter("danger")
 		create_tween().tween_method(func(x: float): vig_mat.set_shader_parameter("danger", x), from, 1.0 if danger else 0.0, 0.6)
-	phase_lbl.text = ("—  SEU TURNO  —" if active == 0 else "—  TURNO DE %s  —" % players[active].name.to_upper()) if not game_over else ""
 	# Pilha
 	stack_panel.visible = not stack.is_empty()
 	var lines := []
 	for i in range(stack.size() - 1, -1, -1):
-		lines.append(("▸ " if i == stack.size() - 1 else "   ") + _entry_text(stack[i]))
+		var top: bool = i == stack.size() - 1
+		var t := _entry_text(stack[i])
+		lines.append(("[b]%s[/b]" % t) if top else "[color=#6e585a]%s[/color]" % t)
 	stack_list.text = "\n".join(lines)
 	pass_btn.visible = waiting_priority
 	_set_pulse(pass_btn, waiting_priority)
+	# A pilha e o prompt ocupam o lugar da dica e do feed: nada se sobrepõe.
+	feed.visible = stack.is_empty() and targeting == ""
 	# Botão de ação
 	action_btn.visible = false
 	var roll_ready := false
@@ -941,34 +1419,35 @@ func _ui() -> void:
 			action_btn.text = "ENCERRAR\nTURNO"
 			action_btn.disabled = false
 	_set_pulse(action_btn, roll_ready)
-	# Dica
+	# Dica (some quando a pilha está aberta: o bilhete já diz o que fazer)
 	var hint := ""
 	if waiting_priority:
-		hint = "Você tem prioridade — responda ou passe."
+		hint = ""
 	elif awaiting_roll:
-		hint = "Combate em andamento. Use itens ou role de novo."
+		hint = ""
 	elif _human_idle():
 		var parts := []
-		if me.attacks > 0: parts.append("toque num monstro para atacar")
-		if me.loot_plays > 0 and not me.hand.is_empty(): parts.append("arraste um loot para cima")
-		if me.bought < me.buy_limit and me.coins >= D.SHOP_PRICE: parts.append("compre na loja")
-		hint = ", ".join(parts)
-		if hint != "": hint = hint[0].to_upper() + hint.substr(1) + "."
+		if me.loot_plays > 0 and not me.hand.is_empty(): parts.append("")
+		if me.bought < me.buy_limit and me.coins >= D.SHOP_PRICE: parts.append("")
+		hint = " ".join(parts)
+		if hint != "": hint = hint[0].to_upper() + hint.substr(1) + ""
 	hint_lbl.text = hint
+	hint_lbl.visible = stack.is_empty() and targeting == ""
 	_update_monster_labels()
 
 func _entry_text(e: Dictionary) -> String:
+	var who: String = "Você" if e.owner.i == 0 else e.owner.name
 	if e.kind == "roll":
-		var v: int = e.value + e.bonus
-		return "%s rolou %d%s — %s" % [e.owner.name, v, " (+%d)" % e.bonus if e.bonus else "", e.name]
-	return "%s: %s" % [e.owner.name, e.name]
+		var b := " [color=#284878]+%d[/color]" % e.bonus if e.bonus else ""
+		return "%s %s%s → %d · %s" % [who, _ic_die(e.value, 20), b, e.value + e.bonus, e.name]
+	return "%s: %s" % [who, e.name]
 
-func _plate_feedback(i: int, l: Label, now: Array) -> void:
+func _plate_feedback(i: int, l: Control, now: Array) -> void:
 	var prev: Array = plate_prev[i]
 	plate_prev[i] = now
 	if prev.is_empty() or prev == now:
 		return
-	var col := Color(1.25, 1.1, 0.75)
+	var col := Color(1.15, 1.05, 0.8)
 	var amt := 1.12
 	if now[0] < prev[0]:
 		col = Color(1.6, 0.45, 0.4)
@@ -977,9 +1456,9 @@ func _plate_feedback(i: int, l: Label, now: Array) -> void:
 		col = Color(0.8, 1.2, 1.7)
 		amt = 1.35
 	elif now[0] > prev[0]:
-		col = Color(1.0, 1.5, 1.0)
+		col = Color(0.8, 1.4, 0.8)
 		Sfx.play("heal")
-	l.pivot_offset = l.size / 2
+	l.pivot_offset = Vector2(0, l.size.y / 2)
 	l.modulate = col
 	l.scale = Vector2(amt, amt)
 	var t := l.create_tween().set_parallel()
@@ -1251,10 +1730,8 @@ func _game_end(winner: Dictionary) -> void:
 		Sel.record(won, players[0].char)
 	Sfx.play("victory" if won else "defeat")
 	overlay.add_child(_embers2d(Color(1.0, 0.75, 0.3) if won else Color(0.8, 0.15, 0.1), 60 if won else 30))
-	var t := _lbl("VITÓRIA" if won else "DERROTA", 52, GOLD if won else Color(0.8, 0.25, 0.2), true)
+	var t := _ulbl("VITÓRIA" if won else "DERROTA", 64, PAPER if won else Color8(200, 50, 60), 12)
 	t.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	t.add_theme_constant_override("outline_size", 12)
-	t.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.8))
 	v.add_child(t)
 	t.scale = Vector2(2.2, 2.2)
 	t.modulate.a = 0
@@ -1263,7 +1740,7 @@ func _game_end(winner: Dictionary) -> void:
 	tt.tween_callback(func(): t.pivot_offset = t.size / 2)
 	tt.tween_property(t, "scale", Vector2.ONE, 0.45).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 	tt.parallel().tween_property(t, "modulate:a", 1.0, 0.25)
-	var s := _lbl("%s reuniu %d almas." % [winner.name, winner.soul_n], 18)
+	var s := _ulbl("%s reuniu %d almas." % [winner.name, winner.soul_n], 22, PAPER, 6)
 	s.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	v.add_child(s)
 	var row := HBoxContainer.new()
@@ -1300,8 +1777,10 @@ func _new_game(cid: String) -> void:
 	loot_ids.shuffle()
 	treasure_ids = D.TREASURE_DECK.duplicate()
 	treasure_ids.shuffle()
-	monster_ids = D.MONSTERS.keys()
+	# Deck de monstros = monstros + eventos/maldições (antes os eventos nunca entravam no deck).
+	monster_ids = D.MONSTERS.keys().filter(func(k): return not D.OUTSIDE.has(k)) + D.EVENTS.keys()
 	monster_ids.shuffle()
+	xp.setup()
 	Sfx.riffle(8)
 	slots = [[], []]
 	shop = [null, null]
@@ -1337,15 +1816,19 @@ func _new_game(cid: String) -> void:
 				_gain_item(p, chosen, Transform3D(FACE_DOWN, Vector3(0, 2.5, -1.0)), true)
 		else:
 			var start_item: String = str(D.CHARACTERS[p.char].item)
-			_gain_item(p, start_item, Transform3D(FACE_DOWN, Vector3(0, 2.5, -1.0)))
+			if D.ITEMS.has(start_item):  # Level One Isaac não tem item inicial
+				_gain_item(p, start_item, Transform3D(FACE_DOWN, Vector3(0, 2.5, -1.0)))
 		await _wait(0.3)
 	for s in shop.size():
 		_shop_fill(s)
 		await _wait(0.2)
 	for i in D.START_LOOT:
 		for p in players:
-			await _draw_loot(p, 1)
+			await _draw_loot(p, 1, true)
+	for p in players:
+		await xp.on_game_start(p)
 	await _refill_slots(true)
+	await xp.room_refill()
 	if autoplay:
 		_autoplay_give()
 	busy = false
@@ -1361,6 +1844,7 @@ func _choose_card(ids: Array, title: String) -> String:
 	var done := [false]
 	for id in ids:
 		var b := TextureButton.new()
+		b.material = _card_mat()
 		b.texture_normal = Card3D.tex(id)
 		b.ignore_texture_size = true
 		b.stretch_mode = TextureButton.STRETCH_KEEP_ASPECT_CENTERED
@@ -1376,20 +1860,23 @@ func _choose_card(ids: Array, title: String) -> String:
 # Painel modal genérico (usado para escolhas de setup).
 func _open_custom_panel(title: String, content: Control) -> void:
 	inspect.visible = true
+	insp_forced = true
+	(inspect as ColorRect).color.a = 0.8
 	insp_tex.texture = null
+	insp_tex.visible = false
 	insp_title.text = title
-	insp_text.text = ""
+	insp_title.visible = true
+	insp_note.visible = false
 	for b in insp_btns.get_children():
 		b.queue_free()
 	_clear_custom_panel()
-	var holder := insp_text.get_parent()
-	holder.set_meta("custom", content)
-	holder.add_child(content)
-	holder.move_child(content, 1)
+	insp_box.set_meta("custom", content)
+	insp_box.add_child(content)
+	insp_box.move_child(content, 2)
 
 # Libera o conteúdo de painel personalizado, se houver.
 func _clear_custom_panel() -> void:
-	var holder := insp_text.get_parent()
+	var holder := insp_box
 	if holder.has_meta("custom") and holder.get_meta("custom") != null:
 		var c = holder.get_meta("custom")
 		holder.set_meta("custom", null)
@@ -1397,6 +1884,7 @@ func _clear_custom_panel() -> void:
 			c.queue_free()
 
 func _sync_decks() -> void:
+	decks.room.set_count(room_ids.size())
 	decks.loot.set_count(loot_ids.size())
 	decks.monster.set_count(monster_ids.size())
 	decks.treasure.set_count(treasure_ids.size())
@@ -1405,9 +1893,13 @@ func _sync_decks() -> void:
 # =====================================================================
 # CARTAS: comprar, posicionar
 # =====================================================================
-func _draw_loot(p: Dictionary, n := 1) -> void:
+# `step` = loot do passo de loot / preparação (Lucky Toe não conta).
+func _draw_loot(p: Dictionary, n := 1, step := false) -> void:
 	if bool(p.state.get("double_loot", false)):
 		n *= 2
+	n = xp.loot_amount(p, n, step)
+	if n <= 0:
+		return
 	for k in n:
 		if bool(p.state.get("compost", false)) and not loot_discard.is_empty():
 			var did: String = loot_discard.pop_back()
@@ -1434,6 +1926,7 @@ func _draw_loot(p: Dictionary, n := 1) -> void:
 		_loot_to_hand(p, id)
 		await _wait(0.16)
 	_check_bonus_souls()
+	xp.after_loot(p, n)
 
 func _loot_to_hand(p: Dictionary, id: String) -> void:
 	var c := Card3D.make(id, "lootback")
@@ -1482,6 +1975,7 @@ func _gain_item(p: Dictionary, id: String, from: Transform3D, eternal := false) 
 		it.counters = 9
 	c.ref = it
 	p.items.append(it)
+	xp.on_item_enter(p, it)
 	if id == "breakfast" or id == "dinner":
 		p.hp += 1
 	if id == "momsshovel":
@@ -1495,7 +1989,9 @@ func _gain_item(p: Dictionary, id: String, from: Transform3D, eternal := false) 
 			_burst(c.global_position + Vector3(0, 0.05, 0), Color(1, 0.85, 0.45), 14, 1.4, 0.05, -1.5, 0.5))
 
 func _is_eternal(it: Dictionary) -> bool:
-	return bool(it.get("eternal", false)) or bool(D.ITEMS[it.id][3])
+	if bool(it.get("no_eternal", false)):  # Birthright: cópia que perde eterno
+		return xp.eternal_now(it)
+	return bool(it.get("eternal", false)) or bool(D.ITEMS[it.id][3]) or xp.eternal_now(it)
 
 func _item_of(p: Dictionary, id: String):
 	for it in p.items:
@@ -1526,10 +2022,11 @@ func _play_trinket(p: Dictionary, c: Card3D) -> void:
 		_check_bonus_souls()
 		_ui()
 		return
-	var it := {"id": c.id, "tapped": false, "card": c, "owner": p, "eternal": false, "counters": 0, "trinket": true}
+	var it := {"id": c.id, "tapped": false, "card": c, "owner": p, "eternal": bool(D.ITEMS[c.id][3]), "counters": 0, "trinket": true}
 	c.zone = "item"
 	c.ref = it
 	p.items.append(it)
+	xp.on_item_enter(p, it)
 	_layout_items(p)
 	_toast("%s: %s entra em jogo" % [p.name, D.ITEMS[c.id][0]])
 	get_tree().create_timer(0.4).timeout.connect(func():
@@ -1540,6 +2037,7 @@ func _play_trinket(p: Dictionary, c: Card3D) -> void:
 
 # Item sai de jogo: trinkets voltam ao descarte de loot, tesouros ao descarte de tesouro.
 func _discard_item(it: Dictionary) -> void:
+	xp.forget_xtarget(it)
 	if it.get("trinket", false):
 		_discard_card(it.card, true)
 	else:
@@ -1592,7 +2090,18 @@ func _find_mon(u: int):
 		var m = _top(s)
 		if m != null and m.uid == u:
 			return m
+	for x in xtargets:
+		if x.uid == u:
+			return x
 	return null
+
+# Monstros no topo dos espaços (os que podem ser alvo).
+func _tops() -> Array:
+	var out := []
+	for s in slots.size():
+		if not slots[s].is_empty():
+			out.append(slots[s].back())
+	return out
 
 func _all_mons() -> Array:
 	var out := []
@@ -1604,33 +2113,57 @@ func _all_mons() -> Array:
 func _has_tag(m: Dictionary, tag: String) -> bool:
 	return (m.get("tags", []) as Array).has(tag)
 
+func _mdata(id: String) -> Array:
+	if D.MONSTERS.has(id):
+		return D.MONSTERS[id]
+	if D.ATTACKABLE.has(id):
+		return D.ATTACKABLE[id]
+	return [_card_disp_name(id), 0, 0, 0, 0, 0, 0, 0, "", ""]  # jogador atacado (pseudo-alvo)
+
 func _make_mon(id: String, s: int, c: Card3D) -> Dictionary:
-	var d: Array = D.MONSTERS[id]
+	var d: Array = _mdata(id)
 	uid += 1
-	var l := _label3d("", 40, Color(1, 0.92, 0.85))
+	var l := _label3d("", 46, Color(1, 0.97, 0.94))
 	l.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-	l.outline_size = 14
-	l.outline_modulate = Color(0.1, 0, 0, 0.95)
-	l.position = Vector3(0, -Card3D.H / 2 - 0.04, 0.12)
+	l.outline_size = 12
+	l.outline_modulate = Color(0.12, 0.02, 0.02, 1)
+	l.position = Vector3(0, -Card3D.H / 2 - 0.02, 0.14)
 	l.no_depth_test = true
+	l.render_priority = 2
+	l.outline_render_priority = 1
+	var heart := Sprite3D.new()
+	heart.texture = load(HUD + "heart.png")
+	heart.pixel_size = 0.0034
+	heart.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	heart.no_depth_test = true
+	heart.render_priority = 0
+	heart.position = Vector3(0, 0.012, -0.001)
+	l.add_child(heart)
 	c.add_child(l)
 	return {"id": id, "uid": uid, "hp": d[1], "max": d[1], "eva": d[2], "atk": d[3],
 		"slot": s, "card": c, "label": l, "tags": (MON_TAG.get(id, []) as Array).duplicate(),
-		"temp_atk": 0, "temp_eva": 0, "hits": 0, "reward_kind": d[9], "text": d[8], "double": false, "prevent_full": 0}
+		"temp_atk": 0, "temp_eva": 0, "hits": 0, "reward_kind": d[9], "text": d[8], "double": false, "prevent_full": 0,
+		"counters": 0, "rolls": 0, "hpc": 0, "atc": 0}
 
 func _update_monster_labels() -> void:
+	for x in xtargets:
+		if x.get("label") != null and is_instance_valid(x.label):
+			(x.label as Label3D).text = str(max(x.hp, 0))
 	for s in slots.size():
 		for m in slots[s]:
 			var l: Label3D = m.label
 			l.visible = m == _top(s)
-			l.text = "♥ %d/%d" % [max(m.hp, 0), m.max]
+			l.text = str(max(m.hp, 0))
+			l.modulate = Color(1, 0.97, 0.94) if m.hp >= m.max else Color(1, 0.8, 0.5)
 			var c: Card3D = m.card
 			var fighting: bool = in_combat and combat.get("uid", -1) == m.uid
 			if targeting == "":
 				c.highlight(fighting, Color(1, 0.25, 0.2))
 
 func _eva(m: Dictionary) -> int:
-	var e: int = m.eva + int(m.get("temp_eva", 0))
+	if m.has("player"):
+		return m.eva
+	var e: int = m.eva + int(m.get("temp_eva", 0)) + xp.eva_mod(m)
 	if _has_tag(m, "larry") and m.hp <= 2:
 		e += 1
 	if _has_tag(m, "mask") and m.hp <= 1:
@@ -1642,10 +2175,14 @@ func _eva(m: Dictionary) -> int:
 	var ap: Dictionary = players[active]
 	if _n(ap, "babyhaunt") > 0 or (ap.curses as Array).has("curseoftheblind"):
 		e += 1
-	return e
+	return max(e, 1)
 
 func _mon_atk(m: Dictionary) -> int:
-	return m.atk + int(m.get("temp_atk", 0))
+	if m.has("player"):
+		return _atk(m.player)
+	if m.has("atk_set"):
+		return int(m.atk_set)
+	return max(0, m.atk + int(m.get("temp_atk", 0)) + xp.mon_atk_mod(m))
 
 # ---------- Expansões de espaço ----------
 func _expand_monster_slots(n: int) -> void:
@@ -1715,18 +2252,27 @@ func _reveal_into(s: int, setup := false) -> void:
 		await _event_resolve(id, c)
 		_discard_card(c, false)
 		return
+	if not setup and xp.indomitable(id) and not slots[s].is_empty():
+		# Indomável: abre um espaço novo em vez de cobrir.
+		_expand_monster_slots(1)
+		s = slots.size() - 1
+		c.fly_to(_slot_xf(s, 0), 0.3, 0.1)
 	var m := _make_mon(id, s, c)
 	c.ref = m
 	slots[s].append(m)
 	_ui()
+	if not setup:
+		await xp.on_mon_enter(m)
 
 func _gain_treasure(p: Dictionary, n := 1) -> void:
+	n = xp.treasure_amount(p, n)
 	for i in n:
 		if treasure_ids.is_empty():
 			return
 		var id: String = treasure_ids.pop_back()
 		decks.treasure.set_count(treasure_ids.size())
 		_gain_item(p, id, decks.treasure.top_xf())
+		xp.on_treasure(p)
 		await _wait(0.05)
 
 func _search_treasure(match_ids: Array) -> String:
@@ -1738,7 +2284,10 @@ func _search_treasure(match_ids: Array) -> String:
 			return id
 	return ""
 
-func _force_discard(p: Dictionary, n: int) -> void:
+# `cost` = descarte pago pelo próprio jogador (Rib of Greed só impede os forçados).
+func _force_discard(p: Dictionary, n: int, cost := false) -> void:
+	if not cost and _n(p, "ribofgreed") > 0:
+		return
 	for i in n:
 		if p.hand.is_empty():
 			break
@@ -1750,7 +2299,9 @@ func _force_discard(p: Dictionary, n: int) -> void:
 	_layout_hand(p)
 	_ui()
 
-func _lose_coins(p: Dictionary, n: int) -> void:
+func _lose_coins(p: Dictionary, n: int, cost := false) -> void:
+	if not cost and _n(p, "ribofgreed") > 0:
+		return
 	var lost: int = min(p.coins, n)
 	p.coins -= lost
 	if lost > 0:
@@ -1760,7 +2311,7 @@ func _lose_coins(p: Dictionary, n: int) -> void:
 
 func _recharge_first(p: Dictionary) -> bool:
 	for it in p.items:
-		if it.tapped:
+		if it.tapped and it.id != "carbattery":
 			it.tapped = false
 			Sfx.play("recharge")
 			_layout_items(p)
@@ -1769,15 +2320,17 @@ func _recharge_first(p: Dictionary) -> bool:
 
 func _recharge_all(p: Dictionary) -> void:
 	for it in p.items:
-		it.tapped = false
+		if it.id != "carbattery":
+			it.tapped = false
 	_layout_items(p)
 
 # ============ EVENTOS ============
 func _event_resolve(id: String, c: Card3D) -> void:
 	var p: Dictionary = players[active]
+	var cpos: Vector3 = c.global_position if is_instance_valid(c) else Vector3.ZERO  # a carta pode ser liberada antes do dado resolver
 	match id:
 		"chest":
-			await _roll(p, "Chest", func(v: int) -> void: _gain_coins(p, [1, 1, 3, 3, 6, 6][v - 1], c.global_position))
+			await _roll(p, "Chest", func(v: int) -> void: _gain_coins(p, [1, 1, 3, 3, 6, 6][v - 1], cpos))
 		"chest_2":
 			await _roll(p, "Chest", func(v: int) -> void: await _draw_loot(p, [1, 1, 2, 2, 3, 3][v - 1]))
 		"cursedchest":
@@ -1790,11 +2343,11 @@ func _event_resolve(id: String, c: Card3D) -> void:
 		"darkchest":
 			await _roll(p, "Dark Chest", func(v: int) -> void:
 				if v <= 2: await _draw_loot(p, 1)
-				elif v <= 4: _gain_coins(p, 3, c.global_position)
+				elif v <= 4: _gain_coins(p, 3, cpos)
 				else: _damage_player(p, 2, null))
 		"darkchest_2":
 			await _roll(p, "Dark Chest", func(v: int) -> void:
-				if v <= 2: _gain_coins(p, 1, c.global_position)
+				if v <= 2: _gain_coins(p, 1, cpos)
 				elif v <= 4: await _draw_loot(p, 2)
 				else: _damage_player(p, 2, null))
 		"goldchest":
@@ -1806,7 +2359,7 @@ func _event_resolve(id: String, c: Card3D) -> void:
 			await _roll(p, "Secret Room!", func(v: int) -> void:
 				if v == 1: _damage_player(p, 3, null)
 				elif v <= 3: _force_discard(p, 2)
-				elif v <= 5: _gain_coins(p, 7, c.global_position)
+				elif v <= 5: _gain_coins(p, 7, cpos)
 				else: await _gain_treasure(p, 1))
 		"trollbombs":
 			_damage_player(p, 2, null)
@@ -1844,13 +2397,11 @@ func _event_resolve(id: String, c: Card3D) -> void:
 		"devildeal":
 			await _resolve_devil_deal(p)
 		"curseofamnesia", "curseofgreed", "curseofloss", "curseofpain", "curseoftheblind":
-			var target: Dictionary = p
-			if p.bot:
-				target = players[0] if randf() < 0.5 else p
+			var target: Dictionary = await xp.curse_target(p, id)
 			(target.curses as Array).append(id)
 			_toast("%s recebe %s" % [target.name, D.EVENTS[id][0]])
 		_:
-			pass
+			await xp.event(id, c, p)
 
 func _resolve_devil_deal(p: Dictionary) -> void:
 	Sfx.play("devil")
@@ -1880,6 +2431,7 @@ func _choose_option(title: String, options: Array, default_i := 0, bot := false,
 	vb.add_theme_constant_override("separation", 8)
 	if card_id != "":
 		var tr := TextureRect.new()
+		tr.material = _card_mat()
 		tr.texture = Card3D.tex(card_id)
 		tr.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 		tr.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
@@ -1900,6 +2452,14 @@ func _choose_option(title: String, options: Array, default_i := 0, bot := false,
 # ---------- Dano em monstros ----------
 func _damage_monster(m: Dictionary, n: int, by: Dictionary) -> void:
 	if _find_mon(m.uid) == null or n <= 0:
+		return
+	if m.has("player"):
+		# Jogador sendo atacado (Battle Royale, The Siren...): o dano vai para ele.
+		_damage_player(m.player, n, null)
+		xp.on_dealt_damage(by, n)
+		return
+	n = xp.pre_mon_damage(m, n, by)
+	if n <= 0:
 		return
 	if int(m.get("prevent_full", 0)) > 0:
 		m.prevent_full = int(m.prevent_full) - 1
@@ -1931,15 +2491,23 @@ func _damage_monster(m: Dictionary, n: int, by: Dictionary) -> void:
 		m.temp_atk = int(m.get("temp_atk", 0)) + 1
 	if _has_tag(m, "echo_right") or _has_tag(m, "echo_left"):
 		_damage_player(players[1 - active], n, null)
-	if m.hp <= 0:
+	xp.on_dealt_damage(by, n)
+	xp.on_mon_damaged(m, n, by)
+	if m.hp <= 0 and _find_mon(m.uid) != null and not xp.prevent_mon_death(m, by):
 		_kill_monster(m, by)
 	_ui()
 
 # ---------- Morte de monstro ----------
 func _kill_monster(m: Dictionary, by: Dictionary) -> void:
+	if m.has("obj"):
+		# Item/sala/alma atacável: tratamento próprio (não é monstro).
+		await xp.kill_xtarget(m, by)
+		return
 	var s: int = m.slot
 	slots[s].erase(m)
-	var d: Array = D.MONSTERS[m.id]
+	monster_died = true
+	by = xp.reward_taker(m, by)
+	var d: Array = _mdata(m.id)
 	if in_combat and combat.get("uid", -1) == m.uid:
 		in_combat = false
 		if awaiting_roll:
@@ -1964,20 +2532,24 @@ func _kill_monster(m: Dictionary, by: Dictionary) -> void:
 	_hitstop(0.05)
 	# Recompensas
 	var roll_val: int = int(m.get("kill_roll", 1))
-	var mult: int = 2 if bool(m.get("double", false)) else 1
+	var mult: int = (2 if bool(m.get("double", false)) else 1) * xp.reward_mult(m, by)
 	if m.reward_kind == "rollcents":
 		_gain_coins(by, roll_val * mult, pos)
 	elif m.reward_kind == "rollloot":
 		await _draw_loot(by, roll_val * mult)
+	elif m.reward_kind == "special":
+		await xp.special_reward(m, by, mult)
 	else:
 		if d[4] > 0:
 			_gain_coins(by, int(d[4]) * mult, pos)
 	if d[5] > 0:
-		await _draw_loot(by, int(d[5]))
-	for i in int(d[6]):
+		await _draw_loot(by, int(d[5]) * mult)
+	for i in int(d[6]) * mult:
 		await _gain_treasure(by, 1)
-	# Alma ou descarte
-	if d[7] > 0:
+	# Alma ou descarte (algumas cartas desviam ou bloqueiam a alma)
+	var soul_to = xp.soul_taker(m, by) if d[7] > 0 else null
+	if soul_to != null:
+		by = soul_to
 		by.soul_n += int(d[7])
 		by.souls.append(c)
 		c.zone = "soul"
@@ -2000,14 +2572,17 @@ func _kill_monster(m: Dictionary, by: Dictionary) -> void:
 			t2.finished.connect(func():
 				_burst(c.global_position, Color(0.6, 0.85, 1.0), 20, 1.5, 0.06, 0.5, 0.8)
 				c.punch(0.1)))
-	else:
+	elif xp.leaves_play(m, by):
 		monster_discard.append(m.id)
 		_discard_card(c, false)
 	_ui()
-	if by.soul_n >= D.SOULS_TO_WIN:
+	if soul_to != null:
+		xp.on_soul_gained(by, m.id)
+	if by.soul_n >= D.SOULS_TO_WIN and not game_over:
 		_game_end(by)
 		return
 	await _mon_death_effect(m, by)
+	await xp.on_mon_killed(m, by)
 	# The Midas Touch: cada monstro morto dá 3¢.
 	if _n(by, "themidastouch") > 0:
 		_gain_coins(by, 3, pos)
@@ -2101,10 +2676,25 @@ func _n(p: Dictionary, id: String) -> int:
 	for it in p.items:
 		if it.id == id:
 			k += 1
+			# Golden Trinket: itens com ficha dourada valem também como o trinket.
+			if bool(it.get("gold", false)):
+				k += _n_raw(p, "goldentrinket")
+	# Item virado sala (Cracked Key): vale para o jogador ativo.
+	if not players.is_empty() and p.i == active:
+		for r in rooms:
+			if r.id == id:
+				k += 1
+	return k
+
+func _n_raw(p: Dictionary, id: String) -> int:
+	var k := 0
+	for it in p.items:
+		if it.id == id:
+			k += 1
 	return k
 
 func _max_hp(p: Dictionary) -> int:
-	return p.base_hp + _n(p, "breakfast") + _n(p, "dinner") + p.temp_hp
+	return p.base_hp + _n(p, "breakfast") + _n(p, "dinner") + p.temp_hp + xp.hp_mod(p)
 
 func _bumbo_level(p: Dictionary) -> int:
 	var it = _item_of(p, "bumbo")
@@ -2118,7 +2708,10 @@ func _atk(p: Dictionary) -> int:
 		a += _n(p, "championbelt") + _n(p, "polydactyly") + _nt(p, "curvedhorn")
 	if p.hand.is_empty():
 		a += _n(p, "emptyvessel")
-	return a
+	a += xp.atk_mod(p)
+	if p.state.has("atk_set"):
+		a = int(p.state.atk_set)
+	return max(a, 0)
 
 func _roll_bonus(p: Dictionary, is_attack := false, first := false) -> int:
 	var r: int = p.temp_roll
@@ -2128,13 +2721,13 @@ func _roll_bonus(p: Dictionary, is_attack := false, first := false) -> int:
 			r += _n(p, "emptyvessel")
 		if first and _bumbo_level(p) >= 1:
 			r += 2
-	return r
+	return r + xp.roll_mod(p, is_attack, first)
 
 func _loot_step(p: Dictionary) -> int:
-	return 1 + _n(p, "momspurse") + _n(p, "momscoinpurse")
+	return 1 + _n(p, "momspurse") + _n(p, "momscoinpurse") + xp.loot_step_mod(p)
 
 func _shop_price(p: Dictionary) -> int:
-	return max(0, D.SHOP_PRICE - 5 * _n(p, "steamysale"))
+	return max(0, D.SHOP_PRICE - 5 * _n(p, "steamysale") - xp.price_off(p))
 
 func _guppy_count(p: Dictionary) -> int:
 	var k := 0
@@ -2143,7 +2736,10 @@ func _guppy_count(p: Dictionary) -> int:
 	return k
 
 func _check_bonus_souls() -> void:
+	if players.is_empty():
+		return
 	var winner: Dictionary = {}
+	xp.check_bonus_souls()
 	for q in players:
 		if not bonus_souls_taken.has("soulofgreed") and q.coins >= 25:
 			bonus_souls_taken["soulofgreed"] = q.i
@@ -2168,9 +2764,13 @@ func _check_bonus_souls() -> void:
 func _opp(p: Dictionary) -> Dictionary:
 	return players[1 - p.i]
 
-func _gain_coins(p: Dictionary, n: int, at: Vector3) -> void:
+func _gain_coins(p: Dictionary, n: int, at: Vector3, raw := false) -> void:
 	if n <= 0 or game_over:
 		return
+	if not raw:
+		n = xp.coin_amount(p, n)
+		if n <= 0:
+			return
 	var bumbo = _item_of(p, "bumbo")
 	if bumbo != null:
 		bumbo.counters += n
@@ -2181,11 +2781,17 @@ func _gain_coins(p: Dictionary, n: int, at: Vector3) -> void:
 	p.coins += amt
 	_float3d("+%d¢" % amt, at, Color(1, 0.82, 0.3))
 	_coin_fly(at, p, amt)
+	if not raw:
+		xp.after_coins(p, amt)
 	_check_bonus_souls()
 	_ui()
 
 func _damage_player(p: Dictionary, n: int, src) -> void:
 	if p.dead or n <= 0 or game_over:
+		return
+	n = xp.pre_player_damage(p, n, src)
+	if n <= 0:
+		_float3d("Prevenido", (p.char_card as Card3D).global_position, Color(0.6, 0.85, 1))
 		return
 	if p.reduce_to1:
 		p.reduce_to1 = false
@@ -2232,7 +2838,7 @@ func _damage_player(p: Dictionary, n: int, src) -> void:
 	cc.punch(0.2)
 	cc.flash_hit(1.0)
 	Sfx.play("hurt", 1.0 if p.i == 0 else 1.12)
-	_float3d("-%d ♥" % n, cc.global_position, Color(1, 0.25, 0.2), true)
+	_float3d("-%d" % n, cc.global_position, Color(1, 0.25, 0.2), true)
 	_burst(cc.global_position + Vector3(0, 0.08, 0), Color(0.55, 0.02, 0.03, 0.95), 16, 2.2, 0.08, -6.0, 0.6, false)
 	_burst(cc.global_position + Vector3(0, 0.08, 0), Color(1, 0.3, 0.2), 10, 2.0, 0.05, -3.0, 0.35)
 	if CHAR_DROPS.has(p.char):
@@ -2254,6 +2860,9 @@ func _damage_player(p: Dictionary, n: int, src) -> void:
 	_ui()
 
 func _on_player_damaged(p: Dictionary, n: int) -> void:
+	await xp.on_player_damaged(p, n)
+	if p.dead:
+		return
 	if _n(p, "fannypack") > 0:
 		await _draw_loot(p, 1)
 	if _nt(p, "swallowedpenny") > 0:
@@ -2283,6 +2892,7 @@ func _on_player_damaged(p: Dictionary, n: int) -> void:
 		_recharge_first(p)
 
 func _mon_dealt_damage(m: Dictionary, p: Dictionary, n: int) -> void:
+	xp.mon_dealt_damage(m, p, n)
 	if _has_tag(m, "lifesteal"):
 		m.hp = min(m.max, m.hp + 1)
 	if _has_tag(m, "keeperhead_coin"):
@@ -2347,6 +2957,10 @@ func _card_disp_name(id: String) -> String:
 		return D.MONSTERS[id][0]
 	if D.EVENTS.has(id):
 		return D.EVENTS[id][0]
+	if D.ROOMS.has(id):
+		return D.ROOMS[id][0]
+	if D.ATTACKABLE.has(id):
+		return D.ATTACKABLE[id][0]
 	return id
 
 func _pick_order(ids: Array, title: String) -> Array:
@@ -2358,7 +2972,7 @@ func _pick_order(ids: Array, title: String) -> Array:
 		var vb := VBoxContainer.new()
 		vb.alignment = BoxContainer.ALIGNMENT_CENTER
 		vb.add_theme_constant_override("separation", 6)
-		vb.add_child(_lbl("Escolha a %dª (topo primeiro)" % (order.size() + 1), 14, GOLD, true))
+		vb.add_child(_ulbl("Escolha a %dª (topo primeiro)" % (order.size() + 1), 18, PAPER, 6))
 		var picked := [""]
 		var done := [false]
 		for id in remaining:
@@ -2381,6 +2995,7 @@ func _reorder_top(deck_key: String, n: int) -> void:
 		"loot": arr = loot_ids; dk = decks.loot
 		"monster": arr = monster_ids; dk = decks.monster
 		"treasure": arr = treasure_ids; dk = decks.treasure
+		"room": arr = room_ids; dk = decks.room
 		_: return
 	var cnt: int = min(n, arr.size())
 	if cnt <= 0:
@@ -2433,10 +3048,15 @@ func _peek(deck_key: String) -> String:
 		"treasure":
 			if treasure_ids.is_empty(): return ""
 			return treasure_ids.back()
+		"room":
+			if room_ids.is_empty(): return ""
+			return room_ids.back()
 	return ""
 
 func _kill_player(p: Dictionary) -> void:
-	if game_over:
+	if game_over or p.dead:
+		return
+	if await xp.prevent_death(p):
 		return
 	# Prevenção de morte
 	if _n(p, "guppyscollar") > 0:
@@ -2478,14 +3098,17 @@ func _kill_player(p: Dictionary) -> void:
 	for q in players:
 		if _nt(q, "bloodypenny") > 0:
 			await _draw_loot(q, 1)
+	await xp.before_penalties(p)
+	var pen: Dictionary = xp.penalty(p)
 	# Maldições-atributo voltam (babyhaunt/daddyhaunt entregues a outro jogador)
 	for cur in ["babyhaunt", "daddyhaunt"]:
 		var ci = _item_of(p, cur)
 		if ci != null:
 			_transfer_item(ci, _opp(p))
 	# Penalidades: 1¢, 1 loot, 1 item não-eterno, tudo virado.
-	p.coins = max(0, p.coins - 1)
-	if not p.hand.is_empty():
+	if pen.coins:
+		p.coins = max(0, p.coins - 1)
+	if pen.loot and not p.hand.is_empty():
 		var c: Card3D = p.hand.pick_random()
 		p.hand.erase(c)
 		if c == selected_card:
@@ -2501,15 +3124,17 @@ func _kill_player(p: Dictionary) -> void:
 			_discard_card(c, true)
 		_layout_hand(p)
 	var lose: Array = p.items.filter(func(it): return not _is_eternal(it))
-	if not lose.is_empty():
+	if pen.item and not lose.is_empty():
 		var it: Dictionary = lose.pick_random()
-		p.items.erase(it)
-		_discard_item(it)
+		if not await xp.penalty_item(p, it):
+			p.items.erase(it)
+			_discard_item(it)
 	for it in p.items:
 		it.tapped = true
 	p.char_tapped = true
 	# Maldições (eventos) vão para descarte.
 	if not p.curses.is_empty():
+		xp.curses_on_death(p)
 		for cur in p.curses:
 			monster_discard.append(cur)
 		p.curses.clear()
@@ -2535,6 +3160,7 @@ func _kill_player(p: Dictionary) -> void:
 	# Depois das penalidades: Lazarus' Rags
 	if _n(p, "lazarusrags") > 0:
 		await _gain_treasure(p, 1)
+	await xp.after_death(p)
 
 func _force_end_turn() -> void:
 	await _settle()
@@ -2577,15 +3203,14 @@ func _start_phase(p: Dictionary) -> void:
 	Sfx.play("banner", 1.0 if p.i == 0 else 0.85, 0.0 if p.i == 0 else -3.0)
 	if p.items.any(func(it): return it.tapped):
 		Sfx.later("recharge", 0.3)
-	for it in p.items:
-		it.tapped = false
-	p.char_tapped = false
-	p.loot_plays = 1 + _n(p, "polydactyly") + _n(p, "bellybutton")
-	p.attacks = 1 + _n(p, "championbelt")
+	xp.recharge_step(p)
+	p.loot_plays = 1 + _n(p, "polydactyly") + _n(p, "bellybutton") + xp.extra_loot_plays(p)
+	p.attacks = 1 + _n(p, "championbelt") + xp.extra_attacks(p)
 	if _bumbo_level(p) >= 25:
 		p.attacks = 99
 	p.bought = 0
 	p.buy_limit = 1 + (1 if _n(p, "theresoptions") > 0 else 0)
+	monster_died = false
 	p.first_roll = true
 	p.state["habit_used"] = false
 	p.reduce_to1 = false
@@ -2623,8 +3248,11 @@ func _start_phase(p: Dictionary) -> void:
 	for pair in [["cainseye", "loot"], ["goldenhorseshoe", "treasure"], ["purpleheart", "monster"]]:
 		if _nt(p, pair[0]) > 0:
 			await _peek_maybe_bottom(p, D.ITEMS[pair[0]][0], pair[1])
+	await xp.on_turn_start(p)
+	if game_over or turn_over:
+		return
 	# Passo de loot
-	await _draw_loot(p, _loot_step(p))
+	await _draw_loot(p, _loot_step(p), true)
 	_check_bonus_souls()
 	_ui()
 
@@ -2636,6 +3264,7 @@ func _end_phase(p: Dictionary) -> void:
 		_lose_coins(p, 4)
 	if p.curses.has("curseofamnesia"):
 		_force_discard(p, 2)
+	await xp.on_turn_end(p)
 	# Efeitos no fim do turno
 	if _n(p, "goathead") > 0 and not p.hand.is_empty():
 		var gopts: Array = []
@@ -2658,10 +3287,11 @@ func _end_phase(p: Dictionary) -> void:
 	if _n(p, "themap") > 0:
 		await _reorder_top("monster", 4)
 	# Descarte até o limite de mão
-	while p.hand.size() > D.HAND_LIMIT:
+	while p.hand.size() > xp.hand_limit(p):
 		var c: Card3D = p.hand.pop_front()
 		_discard_card(c, true)
 	_revert_copies()  # Diplopia/Placebo voltam a ser o que eram
+	await xp.after_revert(p)
 	# Fim de turno: todos curam, monstros também.
 	for q in players:
 		q.temp_atk = 0
@@ -2679,19 +3309,23 @@ func _end_phase(p: Dictionary) -> void:
 		(q.char_card as Card3D).set_gore(0.0)  # todos curam: as cartas se limpam devagar
 	for s in slots.size():
 		for m in slots[s]:
-			m.hp = m.max
+			if not _has_tag(m, "noheal"):
+				m.hp = m.max
 			m.temp_atk = 0
 			m.temp_eva = 0
+			m.erase("atk_set")
 			(m.card as Card3D).set_gore(0.0)
+	xp.on_cleanup()
 	_layout_hand(p)
 	_ui()
 	await _refill_slots()
+	await xp.after_end(p)
 	await _settle()
 	await _wait(0.3)
 
 func _trinity_blocked(actor: Dictionary) -> bool:
 	var cur: Dictionary = players[active]
-	return not is_same(actor, cur) and _n(cur, "trinityshield") > 0
+	return (not is_same(actor, cur) and _n(cur, "trinityshield") > 0) or xp.blocked(actor)
 
 func _human_idle() -> bool:
 	return active == 0 and not players[0].bot and stack.is_empty() and not busy and not in_combat \
@@ -2844,6 +3478,7 @@ func _resolve(e: Dictionary) -> void:
 # ---------- Rolagens ----------
 func _roll(p: Dictionary, name: String, on_res: Callable, extra := {}) -> void:
 	var v := _rand_roll(p)
+	v = await xp.adjust_roll(p, v, extra)  # vários dados / resultado fixado (antes do lançamento)
 	busy = true
 	_ui()
 	var from := (p.char_card as Card3D).position + Vector3(0, 1.0, -0.3 if p.i == 0 else 0.3)
@@ -2851,6 +3486,7 @@ func _roll(p: Dictionary, name: String, on_res: Callable, extra := {}) -> void:
 	await dice.throw(v, from, to)
 	_dice_landed(v)
 	busy = false
+	v = await xp.change_roll(p, v, extra)  # P.H.D., Telepathy, Isaac's Blessing (depois de ver o dado)
 	var e := {"kind": "roll", "owner": p, "name": name, "value": v, "on_res": on_res}
 	e.merge(extra)
 	await _roll_triggers(p, v)
@@ -2955,6 +3591,7 @@ func _roll_triggers(p: Dictionary, v: int) -> void:
 			p.hp = min(_max_hp(p), p.hp + 1)
 		if v == 6 and _has_tag(m, "curse_roll6_end"):
 			turn_over = true
+	await xp.roll_triggers(p, v)
 
 func _reroll(e: Dictionary) -> void:
 	if not stack.has(e):
@@ -2987,15 +3624,55 @@ func _dice_landed(v: int) -> void:
 # =====================================================================
 func _act_attack(p: Dictionary, s: int) -> void:
 	var m = _top(s)
-	if m == null or p.attacks <= 0:
+	if m == null:
+		return
+	await _attack(p, m)
+
+func _tname(m: Dictionary) -> String:
+	return str(m.get("name", "")) if m.has("name") else str(_mdata(m.id)[0])
+
+# Ataca o topo do deck de monstros: a carta cobre um espaço e o ataque segue contra ela.
+func _act_attack_deck(p: Dictionary) -> void:
+	if monster_ids.is_empty() or in_combat:
+		return
+	var free: bool = int(p.state.get("deck_attacks", 0)) > 0
+	if not free and p.attacks <= 0:
+		return
+	if free:
+		p.state.deck_attacks = int(p.state.deck_attacks) - 1
+	else:
+		p.attacks -= 1
+	var s: int = await xp.pick_slot_for_deck(p)
+	await xp.before_deck_attack(p)
+	last_revealed = {}
+	_toast("%s ataca o topo do deck de monstros" % p.name)
+	await _reveal_into(s)
+	p.state["deck_attacked"] = true
+	if last_revealed.is_empty() or _find_mon(last_revealed.uid) == null or p.dead or turn_over:
+		return
+	if await xp.cancel_deck_attack(p):
+		return
+	await _attack(p, last_revealed, true)
+
+var last_revealed: Dictionary = {}
+
+# Ataque a qualquer alvo: monstro, objeto atacável ou jogador (`free` = não gasta ataque).
+func _attack(p: Dictionary, m: Dictionary, free := false) -> void:
+	if (p.attacks <= 0 and not free) or in_combat:
 		return
 	if _has_tag(m, "untargetable"):
-		_toast("%s não pode ser atacado" % D.MONSTERS[m.id][0])
+		_toast("%s não pode ser atacado" % _tname(m))
 		return
-	p.attacks -= 1
+	var why: String = xp.can_attack(p, m)
+	if why != "":
+		_toast(why)
+		return
+	if not free:
+		p.attacks -= 1
+	m = await xp.redirect_attack(p, m)
 	in_combat = true
-	combat = {"p": p, "uid": m.uid}
-	_toast("%s ataca %s" % [p.name, D.MONSTERS[m.id][0]])
+	combat = {"p": p, "uid": m.uid, "team": [], "rolls": 0}
+	_toast("%s ataca %s" % [p.name, _tname(m)])
 	# Câmera aproxima levemente do monstro durante o combate.
 	cam_focus_target = Vector3((m.card as Card3D).position.x * 0.15, -0.35, -0.3)
 	(p.char_card as Card3D).lunge((m.card as Card3D).global_position, 0.2)
@@ -3003,6 +3680,7 @@ func _act_attack(p: Dictionary, s: int) -> void:
 	_ui()
 	if _has_tag(m, "pride_declare"):
 		_force_discard(_opp(p), 2)
+	await xp.on_attack_declared(p, m)
 	if _n(p, "bobsbrain") > 0:
 		await _roll(p, "Bob's Brain", func(v: int) -> void:
 			if v <= 2:
@@ -3030,7 +3708,14 @@ func _act_attack(p: Dictionary, s: int) -> void:
 		var mu: int = combat.uid
 		var on_res := func(v: int) -> void: await _resolve_attack(p, mu, v)
 		await _roll(p, "ataque", on_res, {"attack": true, "mon_uid": mu, "first": p.first_roll})
+		# Team Up: cada parceiro rola contra o mesmo alvo depois de cada rolagem do atacante.
+		for q in (combat.get("team", []) as Array).duplicate():
+			if not in_combat or q.dead or p.dead or game_over or _find_mon(mu) == null:
+				break
+			var q_res := func(v: int) -> void: await _resolve_attack(q, mu, v)
+			await _roll(q, "ataque (equipe)", q_res, {"attack": true, "mon_uid": mu, "first": q.first_roll, "team": true})
 	in_combat = false
+	xp.on_attack_end(p)
 	awaiting_roll = false
 	cam_focus_target = Vector3.ZERO
 	_ui()
@@ -3048,6 +3733,11 @@ func _resolve_attack(p: Dictionary, mu: int, v: int) -> void:
 	m.double = _has_tag(m, "double6_death") and raw == 6
 	var mc: Card3D = m.card
 	var pc: Card3D = p.char_card
+	m.rolls = int(m.get("rolls", 0)) + 1
+	if is_same(p, combat.get("p", null)):
+		combat.rolls = int(combat.get("rolls", 0)) + 1
+	var hit: bool = total >= _eva(m) and not xp.attack_miss_forced(p, m, raw)
+	m.last_roll = raw
 	# Gatilhos por valor de rolagem
 	if raw == 3 and _has_tag(m, "steal3"):
 		_steal_random_loot(p, _opp(p))
@@ -3060,12 +3750,14 @@ func _resolve_attack(p: Dictionary, mu: int, v: int) -> void:
 		_damage_player(_opp(p), 99, null)
 	if raw == 6 and _has_tag(m, "end6"):
 		turn_over = true
-	if total >= _eva(m):
-		if (_has_tag(m, "immune6") and raw == 6) or (_has_tag(m, "immune45") and (raw == 4 or raw == 5)):
-			_toast("%s é imune a essa rolagem" % D.MONSTERS[m.id][0])
+	if hit:
+		if (_has_tag(m, "immune6") and raw == 6) or (_has_tag(m, "immune45") and (raw == 4 or raw == 5)) or xp.combat_immune(m, raw):
+			_toast("%s é imune a essa rolagem" % _tname(m))
 			_float3d("IMUNE", mc.global_position, Color(0.7, 0.75, 0.8))
 			mc.shake(0.02)
+			await xp.after_attack_roll(p, m, raw, true)
 			return
+		dmg = xp.combat_dmg(p, m, raw, dmg)
 		_toast("Acerto! %d de dano" % dmg, Color(1, 0.9, 0.55))
 		# Investida do personagem; o dano entra no impacto.
 		pc.lunge(mc.global_position, 0.35)
@@ -3078,6 +3770,7 @@ func _resolve_attack(p: Dictionary, mu: int, v: int) -> void:
 			_damage_player(players[(active + 1) % players.size()], 1, null)
 		if _has_tag(m, "lust_thorns"):
 			_damage_player(p, 1, null)
+		await xp.on_combat_hit(p, m, raw, dmg)
 	else:
 		var d: int = _mon_atk(m)
 		if _has_tag(m, "dbl1") and raw == 1:
@@ -3086,27 +3779,39 @@ func _resolve_attack(p: Dictionary, mu: int, v: int) -> void:
 			d += 1
 		if _has_tag(m, "chub") and raw == 1:
 			m.hp = min(m.max, m.hp + 2)
-		_toast("Errou — %s causa %d" % [D.MONSTERS[m.id][0], d], Color(1, 0.6, 0.5))
+		d = xp.player_combat_dmg(p, m, raw, d)
+		_toast("Errou — %s causa %d" % [_tname(m), d], Color(1, 0.6, 0.5))
 		_float3d("ERROU", mc.global_position, Color(0.85, 0.8, 0.75))
 		mc.lunge(pc.global_position, 0.4)
 		Sfx.play("mon_grunt")
 		await _wait(0.17)
 		if p.dead or game_over:
 			return
+		combat_damage = true
 		_damage_player(p, d, m)
+		combat_damage = false
+		await xp.on_attack_miss(p, m, raw)
+	await xp.after_attack_roll(p, m, raw, hit)
 
+# s >= 0: espaço da loja · -1: topo do deck de tesouros · -2: topo do descarte de tesouros (Recycling Sticker).
 func _act_buy(p: Dictionary, s: int) -> void:
 	if p.bought >= p.buy_limit:
 		return
-	var price: int = _shop_price(p) if s >= 0 else D.SHOP_PRICE
+	var price: int = _shop_price(p) if s >= 0 or s == -2 else D.SHOP_PRICE
+	if s >= 0 and xp.free_purchase(p):
+		price = 0
 	if p.coins < price:
 		return
 	# Valida a origem ANTES de cobrar (antes o jogador perdia ¢ com o deck/espaço vazio).
-	if (s < 0 and treasure_ids.is_empty()) or (s >= 0 and shop[s] == null):
+	if (s == -1 and treasure_ids.is_empty()) or (s >= 0 and shop[s] == null) or (s == -2 and treasure_discard.is_empty()):
 		return
 	var from: Transform3D
 	var id: String
-	if s < 0:
+	if s == -2:
+		p.coins -= price
+		id = treasure_discard.pop_back()
+		from = decks.treasure.top_xf()
+	elif s < 0:
 		p.coins -= price
 		id = treasure_ids.pop_back()
 		decks.treasure.bump()
@@ -3126,22 +3831,33 @@ func _act_buy(p: Dictionary, s: int) -> void:
 	_toast("%s comprou %s" % [p.name, D.ITEMS[id][0]])
 	_gain_item(p, id, from)
 	_ui()
+	await xp.on_purchase(p, id, price)
 	await _wait(0.4)
-	if s >= 0:
+	if s >= 0 and xp.shop_refills():
 		_shop_fill(s)
 
 func _act_tap_char(p: Dictionary) -> void:
 	if p.char_tapped:
 		return
+	if not xp.pay_tap(p):
+		return
 	p.char_tapped = true
 	Sfx.play("char_tap")
+	if await xp.tap_char(p):
+		_layout_items(p)
+		_ui()
+		return
 	p.loot_plays += 1
 	_layout_items(p)
 	_ui()
 
 # Joga um loot. `target` já escolhido quando o loot precisa de alvo.
-func _act_play_loot(p: Dictionary, c: Card3D, target = null) -> void:
-	if p.i == active and p.loot_plays > 0:
+func _act_play_loot(p: Dictionary, c: Card3D, target = null, free := false) -> void:
+	if free:
+		pass
+	elif not xp.may_play_loot(p):
+		return
+	elif p.i == active and p.loot_plays > 0:
 		p.loot_plays -= 1
 	elif not p.char_tapped:
 		p.char_tapped = true
@@ -3167,6 +3883,7 @@ func _act_play_loot(p: Dictionary, c: Card3D, target = null) -> void:
 		var mu: int = target.m.uid
 		e.valid = func() -> bool: return _find_mon(mu) != null
 	_toast("%s joga %s" % [p.name, D.LOOT[id][0]])
+	xp.on_loot_played(p, id, e)
 	_push(e)
 	await _run_stack()
 
@@ -3315,7 +4032,7 @@ func _loot_effect(p: Dictionary, id: String, target, e: Dictionary) -> Callable:
 						for q in players: await _draw_loot(q, 5)
 					else:
 						for q in players: _gain_coins(q, 6, (q.char_card as Card3D).global_position))
-	return func() -> void: pass
+	return xp.loot_effect(p, id, target, e)
 
 # ---------- Auxiliares de loot ----------
 func _target_p(target, p: Dictionary) -> Dictionary:
@@ -3531,15 +4248,23 @@ func _remote_detonator(p: Dictionary) -> void:
 func _destroy_item(p: Dictionary, it: Dictionary) -> void:
 	if _is_eternal(it):
 		return
+	if await xp.on_destroy(p, it):
+		return
 	# The Chest: se fosse destruído, vira uma alma.
 	if it.id == "thechest":
 		_item_to_soul(p, it)
 		return
+	# Remove de quem tem o item agora (pode ter mudado de dono durante um await); já fora de jogo = nada a fazer.
+	var holder = null
+	for q in players:
+		if q.items.has(it):
+			holder = q
+	if holder == null or not is_instance_valid(it.card):
+		return
 	Sfx.play("destroy")
-	if p.items.has(it):
-		p.items.erase(it)
+	holder.items.erase(it)
 	_discard_item(it)
-	_layout_items(p)
+	_layout_items(holder)
 
 func _item_to_soul(p: Dictionary, it: Dictionary) -> void:
 	var c: Card3D = it.card
@@ -3569,6 +4294,7 @@ func _cancel_ability(p: Dictionary) -> void:
 			break
 
 func _on_item_activated(p: Dictionary, _it: Dictionary) -> void:
+	xp.on_item_activated(p, _it)
 	if _n(p, "shinyrock") > 0:
 		_gain_coins(p, 1, (p.char_card as Card3D).global_position)
 	for m in _all_mons():
@@ -3578,7 +4304,7 @@ func _on_item_activated(p: Dictionary, _it: Dictionary) -> void:
 			_damage_player(p, 1, m)
 
 func _item_needs_target(id: String) -> bool:
-	return id in ["yumheart", "bloodlust", "mrboom", "razorblade", "guppyspaw", "jawbone", "momsbra", "twoofclubs", "thed4"]
+	return id in ["yumheart", "bloodlust", "mrboom", "razorblade", "guppyspaw", "jawbone", "momsbra", "twoofclubs", "thed4"] or xp.item_needs_target(id)
 
 func _paid_cost(id: String) -> int:
 	return {"batterybum": 4, "goldenrazorblade": 5, "paytoplay": 10, "portableslotmachine": 3}.get(id, 0)
@@ -3586,6 +4312,8 @@ func _paid_cost(id: String) -> int:
 func _paid_usable(it: Dictionary) -> bool:
 	var id: String = it.id
 	if players[0].coins < _paid_cost(id):
+		return false
+	if not xp.paid_usable(it):
 		return false
 	if id == "smelter" and players[0].hand.is_empty():
 		return false
@@ -3678,7 +4406,11 @@ func _act_paid(p: Dictionary, it: Dictionary, target = null) -> void:
 			_layout_items(p)
 			_layout_items(_opp(p))
 			_gain_coins(p, 8, ppos)
+		_:
+			if not await xp.item_paid(p, it, target):
+				return
 	Sfx.play("item_use")
+	xp.on_item_activated(p, it)
 	_ui()
 
 func _act_item(p: Dictionary, it: Dictionary, target = null) -> void:
@@ -3860,15 +4592,21 @@ func _act_item(p: Dictionary, it: Dictionary, target = null) -> void:
 		"twoofclubs":
 			e.fn = func() -> void: _target_p(target, p).state["double_loot"] = true
 		_:
-			return
+			if not await xp.item_tap(p, it, target, e):
+				return
+	if not xp.pay_tap(p):
+		return
 	it.tapped = true
 	Sfx.play("item_use")
 	_layout_items(p)
-	# Cópia fantasma do item sobe para a pilha.
-	(it.card as Card3D).sheen(0.4)
+	# Cópia fantasma do item sobe para a pilha (o item pode ter sido destruído ao ativar: Magic Skin, Glass Cannon...).
+	var src_ok := is_instance_valid(it.card)
+	if src_ok:
+		(it.card as Card3D).sheen(0.4)
 	var ghost := Card3D.make(id, "treasureback")
 	table.add_child(ghost)
-	ghost.transform = (it.card as Card3D).transform
+	if src_ok:
+		ghost.transform = (it.card as Card3D).transform
 	ghost.zone = "stack"  # inspecionável enquanto está na pilha
 	ghost.tapped.connect(_on_card_tapped)
 	e.card = ghost
@@ -3906,6 +4644,8 @@ func _choose_item(p: Dictionary, ok: Callable, title: String, hostile := false):
 
 # Item vira cópia de outro. Temporário = volta ao original no fim do turno.
 func _copy_item(it: Dictionary, new_id: String, temporary: bool) -> void:
+	if not is_instance_valid(it.card):
+		return  # o item saiu de jogo antes da habilidade resolver
 	if temporary and not it.has("orig_id"):
 		it.orig_id = it.id
 	it.id = new_id
@@ -3955,21 +4695,66 @@ func _on_action() -> void:
 	if awaiting_roll:
 		roll_requested.emit()
 	elif _human_idle():
+		var must: String = xp.must_attack_reason(players[0])
+		if must != "":
+			_toast(must, Color(1, 0.6, 0.5))
+			return
 		end_turn_requested.emit()
 
-func _on_deck_tapped(_d: Deck3D, kind: String) -> void:
+func _on_deck_tapped(d: Deck3D, kind: String) -> void:
 	if targeting != "" or overlay.visible:
 		return
 	match kind:
 		"treasure":
-			_open_inspect("treasureback", "Deck de Tesouros", "%d cartas. Compre a carta do topo às cegas por %d¢." % [treasure_ids.size(), D.SHOP_PRICE],
-				[["COMPRAR TOPO · 10¢", func(): _close_inspect(); _act_buy(players[0], -1), _human_idle() and players[0].bought < players[0].buy_limit and players[0].coins >= D.SHOP_PRICE]])
+			var me0: Dictionary = players[0]
+			var tb := [["COMPRAR TOPO · 10¢", func(): _close_inspect(); _act_buy(me0, -1), _human_idle() and me0.bought < me0.buy_limit and me0.coins >= D.SHOP_PRICE]]
+			if _n(me0, "recyclingsticker") > 0 and not treasure_discard.is_empty():
+				tb.append(["COMPRAR DO DESCARTE · %d¢" % _shop_price(me0), func(): _close_inspect(); _act_buy(me0, -2), _human_idle() and me0.bought < me0.buy_limit and me0.coins >= _shop_price(me0)])
+			_open_inspect("treasureback", "Deck de Tesouros", "%d cartas. Compre a carta do topo às cegas por %d¢." % [treasure_ids.size(), D.SHOP_PRICE], tb)
 		"monster":
-			_open_inspect("monsterback", "Deck de Monstros", "%d cartas. Monstros, bosses e eventos." % monster_ids.size(), [])
+			var me1: Dictionary = players[0]
+			var can: bool = _human_idle() and not monster_ids.is_empty() and (me1.attacks > 0 or int(me1.state.get("deck_attacks", 0)) > 0)
+			_open_inspect("monsterback", "Deck de Monstros", "%d cartas. Atacar o topo: a carta revelada cobre um espaço e você a ataca." % monster_ids.size(),
+				[["ATACAR O TOPO", func(): _close_inspect(); _act_attack_deck(me1), can]])
+		"room":
+			d.bump()
+			_float3d("%d salas" % room_ids.size(), d.global_position, PAPER)
 		"loot":
-			_open_inspect("lootback", "Deck de Loot", "%d cartas." % loot_ids.size(), [])
+			# Sem interação possível: só a contagem, sem abrir janela.
+			var n: int = monster_ids.size() if kind == "monster" else loot_ids.size()
+			d.bump()
+			_float3d("%d cartas" % n, d.global_position, PAPER)
 		"discard":
-			_open_inspect("lootback", "Descarte", "%d cartas." % loot_discard.size(), [])
+			_open_discard()
+
+# Descarte de loot é informação pública: grade rolável (mais recente primeiro), toque amplia.
+func _open_discard() -> void:
+	if loot_discard.is_empty():
+		_toast("Descarte vazio")
+		return
+	var sc := ScrollContainer.new()
+	sc.custom_minimum_size = Vector2(480, 600)
+	sc.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	sc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	var g := GridContainer.new()
+	g.columns = 3
+	g.add_theme_constant_override("h_separation", 10)
+	g.add_theme_constant_override("v_separation", 10)
+	sc.add_child(g)
+	for k in range(loot_discard.size() - 1, -1, -1):
+		var id: String = loot_discard[k]
+		var b := TextureButton.new()
+		b.material = _card_mat()
+		b.texture_normal = Card3D.tex(id)
+		b.ignore_texture_size = true
+		b.stretch_mode = TextureButton.STRETCH_KEEP_ASPECT_CENTERED
+		b.custom_minimum_size = Vector2(150, 205)
+		b.pressed.connect(func(): _open_inspect(id, D.LOOT[id][0] if D.LOOT.has(id) else id, D.LOOT[id][1] if D.LOOT.has(id) else "", []))
+		g.add_child(b)
+	_open_custom_panel("DESCARTE · %d" % loot_discard.size(), sc)
+	insp_forced = false
+	var close := _btn("FECHAR", _close_inspect, false)
+	insp_btns.add_child(close)
 
 func _on_card_tapped(c: Card3D) -> void:
 	if overlay.visible or game_over:
@@ -3992,32 +4777,42 @@ func _on_card_tapped(c: Card3D) -> void:
 			drag_card = c
 			drag_from = get_viewport().get_mouse_position()
 			drag_active = false
+		"room":
+			xp.inspect_room(c)
 		"item":
 			var it: Dictionary = c.ref
 			var info: Array = D.ITEMS[it.id]
 			var btns := []
+			var xt = xp.xtarget_of(it)
+			if xt != null:
+				btns.append(["ATACAR", func(): _close_inspect(); _attack(me, xt), _human_idle() and me.attacks > 0])
 			if is_same(it.owner, me):
 				var mode: String = info[2]
 				if mode in ["tap", "both"]:
 					btns.append(["ATIVAR", func(): _close_inspect(); _human_item(it), not it.tapped and _human_has_priority() and _item_usable(it.id)])
 				if mode in ["paid", "both"]:
 					btns.append(["PAGAR", func(): _close_inspect(); _human_item_paid(it), _human_has_priority() and _paid_usable(it)])
-			_open_inspect(it.id, info[0] + ("  (virado)" if it.tapped else ""), info[1] + ("\nEterno." if info[3] else ""), btns)
+			_open_inspect(it.id, info[0] + ("  (virado)" if it.tapped else ""), info[1] + ("\nEterno." if info[3] else "") + xp.counter_note(it), btns)
 		"char":
 			var p: Dictionary = c.ref
-			var txt := "♥ %d/%d   ⚔ %d   ¢ %d\nVire: jogue um loot adicional (pode ser feito no turno de qualquer jogador)." % [max(p.hp, 0), _max_hp(p), _atk(p), p.coins]
+			var st := "%s %d/%d    %s %d    %s %d    %d/%d almas" % [_ic("heart", 22), max(p.hp, 0), _max_hp(p), _ic("sword", 22), _atk(p), _ic("coin", 22), p.coins, p.soul_n, D.SOULS_TO_WIN]
+			var txt := "Vire: jogue um loot adicional (pode ser feito no turno de qualquer jogador)."
 			var btns := []
 			if is_same(p, me):
 				btns.append(["VIRAR (+1 LOOT)", func(): _close_inspect(); _act_tap_char(me), not me.char_tapped and _human_has_priority() and active == 0])
-			_open_inspect(p.char, p.name, txt, btns)
+			else:
+				var dc: int = xp.player_attack_dc(me, p)
+				if dc > 0:
+					btns.append(["ATACAR (%d+)" % dc, func(): _close_inspect(); _attack(me, xp.player_target(p, dc)), _human_idle() and me.attacks > 0])
+			txt = xp.char_text(p, txt)
+			_open_inspect(p.char, p.name, txt, btns, st)
 		"monster":
 			var m = c.ref
 			if m == null or not (m is Dictionary) or not m.has("uid"):
 				return
-			var d: Array = D.MONSTERS[m.id]
-			var txt := "♥ %d/%d   Evasão %d+   ⚔ %d" % [max(m.hp, 0), m.max, _eva(m), _mon_atk(m)]
-			if String(d[8]) != "":
-				txt += "\n" + String(d[8])
+			var d: Array = _mdata(m.id)
+			var st := "%s %d/%d    %s %d+    %s %d" % [_ic("heart", 22), max(m.hp, 0), m.max, _ic_die(_eva(m), 22), _eva(m), _ic("sword", 22), _mon_atk(m)]
+			var txt := String(d[8])
 			var rew := []
 			if d[4]: rew.append("%d¢" % d[4])
 			if d[5]: rew.append("loot %d" % d[5])
@@ -4025,17 +4820,18 @@ func _on_card_tapped(c: Card3D) -> void:
 			if d[7]: rew.append("%d alma" % d[7])
 			if String(d[9]) == "rollcents": rew.append("¢ (por rolagem)")
 			elif String(d[9]) == "rollloot": rew.append("loot (por rolagem)")
+			if int(m.get("counters", 0)) > 0: txt += "\nFichas: %d" % int(m.counters)
 			if not rew.is_empty():
-				txt += "\nRecompensa: " + ", ".join(rew)
+				txt += ("\n" if txt != "" else "") + "Recompensa: " + ", ".join(rew)
 			var is_top: bool = _find_mon(m.uid) != null
-			_open_inspect(m.id, d[0], txt, [["ATACAR", func(): _close_inspect(); _act_attack(me, m.slot), is_top and _human_idle() and me.attacks > 0]])
+			_open_inspect(m.id, d[0], txt, [["ATACAR", func(): _close_inspect(); _act_attack(me, m.slot), is_top and _human_idle() and me.attacks > 0]], st)
 		"shop":
 			var s: int = c.ref
 			var info: Array = D.ITEMS[c.id]
 			var pr: int = _shop_price(me)
 			_open_inspect(c.id, info[0], info[1], [["COMPRAR · %d¢" % pr, func(): _close_inspect(); _act_buy(me, s), _human_idle() and me.bought < me.buy_limit and me.coins >= pr]])
 		"soul":
-			_open_inspect(c.id, D.MONSTERS[c.id][0], "Alma de %s." % c.ref.name, [])
+			_open_inspect(c.id, _card_disp_name(c.id), "Alma de %s." % c.ref.name, [])
 		"stack", "discard":
 			if D.LOOT.has(c.id):
 				_open_inspect(c.id, D.LOOT[c.id][0], D.LOOT[c.id][1], [])
@@ -4048,7 +4844,7 @@ func _inspect_hand_card(c: Card3D) -> void:
 		selected_card = c
 		_layout_hand(me)
 	var info: Array = D.LOOT[c.id]
-	_open_inspect(c.id, info[0], info[1] + "\n\nDica: arraste a carta para cima para jogar direto.",
+	_open_inspect(c.id, info[0], info[1],
 		[["JOGAR", func(): _close_inspect(); _human_play_loot(c), _human_can_play_loot() and _loot_playable(c.id)]])
 
 # Arrastar carta da mão: segue o dedo (com inclinação/flexão pela velocidade) e joga ao soltar no alto.
@@ -4100,6 +4896,8 @@ func _input(event: InputEvent) -> void:
 			_layout_hand(players[0])
 
 func _loot_playable(id: String) -> bool:
+	if not xp.loot_playable(id):
+		return false
 	match D.LOOT[id][2]:
 		"roll":
 			return _top_roll() != null
@@ -4110,6 +4908,8 @@ func _loot_playable(id: String) -> bool:
 func _item_usable(id: String) -> bool:
 	if id in ["d6", "spoon", "bookofbelial", "luckyfoot", "minimush", "godhead"]:
 		return _top_roll() != null
+	if not xp.item_usable(id):
+		return false
 	if id == "no":
 		return _top_cancelable() != null
 	return true
@@ -4135,7 +4935,7 @@ func _human_item(it: Dictionary) -> void:
 	await _act_item(me, it, target)
 
 func _paid_needs_target(id: String) -> bool:
-	return id in ["goldenrazorblade", "techx", "thebone"]
+	return id in ["goldenrazorblade", "techx", "thebone"] or xp.paid_needs_target(id)
 
 func _human_item_paid(it: Dictionary) -> void:
 	var me: Dictionary = players[0]
@@ -4146,12 +4946,20 @@ func _human_item_paid(it: Dictionary) -> void:
 			return
 	await _act_paid(me, it, target)
 
-func _open_inspect(tex_id: String, title: String, text: String, btns: Array) -> void:
+# `stats` = linha de atributos já em BBCode (ícones); `text` é texto puro da carta.
+func _open_inspect(tex_id: String, title: String, text: String, btns: Array, stats := "") -> void:
 	Sfx.play("inspect")
 	inspect.visible = true
+	insp_forced = false
+	insp_tex.visible = true
 	insp_tex.texture = Card3D.tex(tex_id)
 	insp_title.text = title
-	insp_text.text = text
+	insp_title.visible = false
+	var body := text.replace("[", "[lb]")
+	if stats != "":
+		body = "[font_size=24]%s[/font_size]%s" % [stats, ("\n" + body) if body != "" else ""]
+	insp_text.text = "[center]%s[/center]" % body
+	insp_note.visible = body != ""
 	_clear_custom_panel()
 	for b in insp_btns.get_children():
 		b.queue_free()
@@ -4173,26 +4981,34 @@ func _open_inspect(tex_id: String, title: String, text: String, btns: Array) -> 
 	var t := insp_tex.create_tween().set_parallel()
 	t.tween_property(bg, "color:a", 0.8, 0.18)
 	t.tween_property(insp_tex, "scale", Vector2.ONE, 0.32).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-	t.tween_property(insp_tex, "rotation", 0.0, 0.4).set_trans(Tween.TRANS_ELASTIC).set_ease(Tween.EASE_OUT)
+	# Salas são horizontais: a arte guardada em pé gira de volta na inspeção.
+	t.tween_property(insp_tex, "rotation", -PI / 2 if D.ROOMS.has(tex_id) else 0.0, 0.4).set_trans(Tween.TRANS_ELASTIC).set_ease(Tween.EASE_OUT)
 	t.tween_property(insp_tex, "modulate:a", 1.0, 0.12)
 	t.tween_property(insp_text, "modulate:a", 1.0, 0.2).set_delay(0.1)
 	t.tween_property(insp_btns, "modulate:a", 1.0, 0.2).set_delay(0.16)
+	t.tween_method(func(x: float): (insp_tex.material as ShaderMaterial).set_shader_parameter("shine", x), -0.2, 1.3, 0.7).set_delay(0.2)
 
 func _close_inspect() -> void:
 	inspect.visible = false
+	insp_forced = false
 	if selected_card != null:
 		selected_card = null
 		_layout_hand(players[0])
 
-func _choose_target(msg: String):
+# `kinds`: "any" (monstro ou jogador), "monster" ou "player"; `mfilter` restringe os monstros.
+func _choose_target(msg: String, kinds := "any", mfilter := Callable()):
 	target_valid = []
-	for s in slots.size():
-		var m = _top(s)
-		if m != null:
-			target_valid.append({"type": "monster", "m": m, "card": m.card})
-	for p in players:
-		if not p.dead:
-			target_valid.append({"type": "player", "p": p, "card": p.char_card})
+	if kinds != "player":
+		for s in slots.size():
+			var m = _top(s)
+			if m != null and (not mfilter.is_valid() or mfilter.call(m)):
+				target_valid.append({"type": "monster", "m": m, "card": m.card})
+	if kinds != "monster":
+		for p in players:
+			if not p.dead:
+				target_valid.append({"type": "player", "p": p, "card": p.char_card})
+	if target_valid.is_empty():
+		return null
 	targeting = msg
 	prompt_lbl.text = msg
 	prompt_panel.visible = true
@@ -4220,13 +5036,15 @@ func _choose_target(msg: String):
 # =====================================================================
 # CPU
 # =====================================================================
+const BOT_PACE := 1.7  # CPU mais lenta: dá tempo de acompanhar cada ação
 func _bot_turn(p: Dictionary) -> void:
-	await _wait(0.8)
+	await _wait(0.8 * BOT_PACE)
 	# Strength antes de atacar, moedas e bombas oportunas; baterias depois de gastar itens.
 	await _bot_play_loots(p)
 	await _bot_use_items(p)
 	await _bot_play_loots(p)
 	await _bot_use_items(p)
+	await xp.bot_turn_extra(p)
 	# Compra
 	if not turn_over and not game_over and p.coins >= D.SHOP_PRICE:
 		var s := -1
@@ -4236,29 +5054,49 @@ func _bot_turn(p: Dictionary) -> void:
 				break
 		if s >= 0:
 			await _act_buy(p, s)
-			await _wait(0.5)
+			await _wait(0.5 * BOT_PACE)
 	# Ataque(s)
-	while not turn_over and not game_over and p.attacks > 0 and not p.dead:
+	var guard := 0
+	while not turn_over and not game_over and not p.dead and guard < 12:
+		guard += 1
+		var forced = xp.bot_forced_attack(p)
+		if forced is String and forced == "deck":
+			await _act_attack_deck(p)
+			await _wait(0.6 * BOT_PACE)
+			continue
+		elif forced is Dictionary:
+			await _attack(p, forced, p.attacks <= 0)
+			await _wait(0.6 * BOT_PACE)
+			continue
+		if p.attacks <= 0:
+			break
 		var best := -1
 		var best_score := -999.0
 		for s in slots.size():
 			var m = _top(s)
 			if m == null or _has_tag(m, "untargetable"):
 				continue
-			var d: Array = D.MONSTERS[m.id]
+			if xp.can_attack(p, m) != "":
+				continue
+			var d: Array = _mdata(m.id)
 			var hit_p: float = clampf((7.0 - _eva(m) + _n(p, "meat") + _n(p, "synthoil")) / 6.0, 0.05, 1.0)
 			var score: float = d[7] * 6.0 + d[4] * 0.4 + d[5] * 0.8 + d[6] * 2.0 + hit_p * 4.0 - m.hp * 0.8 - _mon_atk(m) * 0.5
 			# Evita suicídio: monstro que mata num erro e é difícil de acertar (antes a CPU vivia atacando Satan).
 			if _mon_atk(m) >= p.hp:
 				score -= (1.0 - hit_p) * 8.0 + m.hp * 0.6
+			score -= int(m.get("bot_fails", 0)) * 4.0  # desiste de alvos em que já morreu
 			if score > best_score:
 				best_score = score
 				best = s
 		if best < 0 or best_score < -3.0:  # nenhum alvo que valha o risco
+			if best < 0 and not monster_ids.is_empty() and p.hp >= 2:
+				await _act_attack_deck(p)
+				await _wait(0.6 * BOT_PACE)
+				continue
 			break
 		await _act_attack(p, best)
-		await _wait(0.6)
-	await _wait(0.5)
+		await _wait(0.6 * BOT_PACE)
+	await _wait(0.5 * BOT_PACE)
 
 func _bot_play_loots(p: Dictionary) -> void:
 	var guard := 0
@@ -4268,7 +5106,7 @@ func _bot_play_loots(p: Dictionary) -> void:
 		if pick.is_empty():
 			break
 		await _act_play_loot(p, pick.card, pick.get("target"))
-		await _wait(0.5)
+		await _wait(0.5 * BOT_PACE)
 
 func _bot_use_items(p: Dictionary) -> void:
 	var o := _opp(p)
@@ -4282,9 +5120,10 @@ func _bot_use_items(p: Dictionary) -> void:
 			"booksin", "sackofpennies": use = true
 			"guppyshead": use = not o.hand.is_empty()
 			"razorblade": use = not o.dead and (o.hp <= 1 or randf() < 0.5)
+			_: use = xp.bot_wants_item(p, it)
 		if use:
 			await _act_item(p, it)
-			await _wait(0.4)
+			await _wait(0.4 * BOT_PACE)
 
 func _bot_pick_loot(p: Dictionary) -> Dictionary:
 	if p.loot_plays <= 0 and p.char_tapped:
@@ -4315,7 +5154,7 @@ func _bot_pick_loot(p: Dictionary) -> Dictionary:
 					return {"card": c, "target": {"type": "monster", "m": m, "card": m.card}}
 			if o.hp <= dmg and not o.dead:
 				return {"card": c, "target": {"type": "player", "p": o, "card": o.char_card}}
-	return {}
+	return xp.bot_pick_loot(p)
 
 func _bot_loot_in_hand(b: Dictionary, id: String) -> Card3D:
 	for c in b.hand:
@@ -4338,7 +5177,7 @@ func _bot_respond() -> bool:
 			return false  # monstro já saiu (antes: crash em _eva(null) ao avaliar o Spoon Bender)
 		var hits := _roll_hits(top)
 		var mine: bool = is_same(top.owner, b)
-		var boss: bool = D.MONSTERS[m.id][7] > 0
+		var boss: bool = _mdata(m.id)[7] > 0
 		if (mine and not hits) or (not mine and hits and boss and m.hp <= _atk(top.owner)):
 			for it in b.items:
 				if it.id == "d6" and not it.tapped:
@@ -4368,7 +5207,7 @@ func _bot_respond() -> bool:
 		if bean != null:
 			_act_play_loot(b, bean)
 			return true
-	return false
+	return xp.bot_respond(b, top, can_loot)
 
 # =====================================================================
 # AUTOPLAY (teste headless) — só ativo com --autoplay / --autoplay-human
@@ -4402,11 +5241,12 @@ func _autoplay_human_loop() -> void:
 
 func _sim_human_action(me: Dictionary) -> void:
 	sim_busy = true
+	var t := autoplay_turns  # o turno pode acabar no meio (morte): não agir no turno da CPU
 	if not me.char_tapped and randf() < 0.35:
 		_act_tap_char(me)
 		await _wait(0.3)
 	var guard := 0
-	while me.attacks > 0 and not turn_over and not game_over and guard < 4:
+	while me.attacks > 0 and _sim_on(t) and guard < 4:
 		guard += 1
 		var s := _sim_pick_monster()
 		if s < 0:
@@ -4414,7 +5254,7 @@ func _sim_human_action(me: Dictionary) -> void:
 		await _act_attack(me, s)
 		await _wait(0.3)
 	for it in me.items.duplicate():
-		if turn_over or game_over:
+		if not _sim_on(t):
 			break
 		if it.tapped:
 			continue
@@ -4425,7 +5265,7 @@ func _sim_human_action(me: Dictionary) -> void:
 			await _human_item_paid(it)
 		await _wait(0.2)
 	guard = 0
-	while _human_can_play_loot() and guard < 3 and not turn_over:
+	while _human_can_play_loot() and guard < 3 and _sim_on(t):
 		guard += 1
 		var c = _sim_pick_loot(me)
 		if c == null:
@@ -4433,12 +5273,33 @@ func _sim_human_action(me: Dictionary) -> void:
 		await _human_play_loot(c)
 		await _wait(0.2)
 	for i in shop.size():
-		if shop[i] != null and me.coins >= _shop_price(me) and not turn_over:
+		if shop[i] != null and me.coins >= _shop_price(me) and _sim_on(t):
 			await _act_buy(me, i)
 			break
-	if active == 0 and not turn_over and not game_over:
+	if _sim_on(t):
+		await xp.sim_extra(me)
+	if _sim_on(t):
 		end_turn_requested.emit()
 	sim_busy = false
+
+func _sim_on(t: int) -> bool:
+	return active == 0 and autoplay_turns == t and not turn_over and not game_over
+
+# --shots=DIR (com janela, sem --headless): capturas periódicas da tela para revisar o HUD; tempo 2×.
+func _autoplay_shots() -> void:
+	var dir := ""
+	for a in OS.get_cmdline_user_args():
+		if a.begins_with("--shots="):
+			dir = a.trim_prefix("--shots=")
+	if dir == "" or DisplayServer.get_name() == "headless":
+		return
+	time_base = 2.0
+	Engine.time_scale = time_base
+	var n := 0
+	while not game_over and n < 40:
+		await get_tree().create_timer(1.5, true, false, true).timeout
+		get_viewport().get_texture().get_image().save_png("%s/shot_%02d.png" % [dir, n])
+		n += 1
 
 # --give=id,id,... : entrega itens (tesouros) ou loots ao jogador 0 para testar cartas específicas.
 func _autoplay_give() -> void:
@@ -4450,21 +5311,24 @@ func _autoplay_give() -> void:
 				_loot_to_hand(players[0], id)
 			elif D.ITEMS.has(id):
 				_gain_item(players[0], id, decks.treasure.top_xf())
+			elif D.MONSTERS.has(id) or D.EVENTS.has(id):
+				monster_ids.erase(id)
+				monster_ids.push_back(id)  # topo do deck: revela logo
+			elif D.ROOMS.has(id):
+				xp.give_room(id)
 			else:
 				push_error("--give: id desconhecido " + id)
 
 func _sim_pick_monster() -> int:
-	var best := -1
+	var opts := []
 	for s in slots.size():
 		var m = _top(s)
-		if m != null and not _has_tag(m, "untargetable"):
-			best = s
-			break
-	return best
+		if m != null and not _has_tag(m, "untargetable") and int(m.get("bot_fails", 0)) < 3:
+			opts.append(s)
+	return opts.pick_random() if not opts.is_empty() else -1
 
 func _sim_pick_loot(me: Dictionary):
 	for c in me.hand:
 		if _loot_playable(c.id):
 			return c
 	return null
-

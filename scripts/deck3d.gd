@@ -4,7 +4,26 @@ extends Node3D
 
 signal tapped(deck: Deck3D)
 
-const PER_CARD := 0.0045
+const PER_CARD := 0.0016
+const MAX_H := 0.09  # teto: decks grandes (loot ~100+) não viram torre
+
+# Laterais = bordas de cartas empilhadas: listras finas em vez de bloco liso.
+const EDGE_SHADER := """
+shader_type spatial;
+render_mode cull_back;
+uniform float freq = 300.0;  // listras por metro (~1 a cada 2 cartas)
+varying vec3 lp;
+void vertex() { lp = VERTEX; }
+void fragment() {
+	float top = step(0.5, abs(NORMAL.y));
+	float s = fract(lp.y * freq);
+	float edge = smoothstep(0.0, 0.18, s) * smoothstep(1.0, 0.72, s);
+	vec3 paper = vec3(0.86, 0.80, 0.70);
+	vec3 gap = vec3(0.30, 0.24, 0.20);
+	ALBEDO = mix(mix(gap, paper, edge), paper * 0.9, top);
+	ROUGHNESS = 0.95;
+}
+"""
 
 var count := 0
 var _body: MeshInstance3D
@@ -16,9 +35,10 @@ var _label: Label3D
 func setup(back_id: String, caption: String, font: Font) -> void:
 	_body = MeshInstance3D.new()
 	_body.mesh = BoxMesh.new()
-	var em := StandardMaterial3D.new()
-	em.albedo_color = Color(0.8, 0.76, 0.68)
-	em.roughness = 0.95
+	var sm := Shader.new()
+	sm.code = EDGE_SHADER
+	var em := ShaderMaterial.new()
+	em.shader = sm
 	_body.material_override = em
 	add_child(_body)
 	_top = MeshInstance3D.new()
@@ -64,7 +84,7 @@ func bump() -> void:
 
 func set_count(n: int) -> void:
 	count = n
-	var h: float = max(n, 1) * PER_CARD
+	var h := _height()
 	(_body.mesh as BoxMesh).size = Vector3(Card3D.W, h, Card3D.H)
 	_body.position.y = h / 2
 	_top.position.y = h + 0.0006
@@ -74,4 +94,7 @@ func set_count(n: int) -> void:
 # Transform (espaço do pai) da carta do topo, deitada com o verso para cima.
 func top_xf() -> Transform3D:
 	var b := Basis(Vector3.RIGHT, PI / 2)  # verso para cima
-	return Transform3D(b, position + Vector3(0, count * PER_CARD + 0.01, 0))
+	return Transform3D(b, position + Vector3(0, _height() + 0.01, 0))
+
+func _height() -> float:
+	return min(max(count, 1) * PER_CARD, MAX_H)

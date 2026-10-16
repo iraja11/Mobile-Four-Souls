@@ -15,7 +15,7 @@ const INK_HOT := Color8(140, 32, 44)
 const INK_SOFT := Color8(110, 88, 90)
 const RANDOM := "random"
 const CARD := Vector2(210, 287)   # carta em destaque (arte 400×546)
-const RING_C := Vector2(270, 374) # centro do anel na coluna 540×960
+const RING_C := Vector2(270, 352) # centro do anel na coluna 540×960
 const STEP := 0.52                # ângulo entre vizinhas
 const RADIUS := 300.0
 const BOARD_POS := Vector2(12, 50)
@@ -64,6 +64,7 @@ var drag_vel := 0.0
 var shown := -1
 var others_a := 1.0            # some com as não escolhidas na confirmação
 var name_tex: TextureRect
+var name_scr  # Scrawl: nome escrito para personagens sem letreiro recortado (expansões)
 var hp_lbl: Scrawl
 var atk_lbl: Scrawl
 var wins_lbl: Scrawl
@@ -300,13 +301,15 @@ func _step(dir: int) -> void:
 func _build_info() -> void:
 	name_tex = _tex("name_isaac.png", Vector2.ZERO, Vector2.ONE)
 	col.add_child(name_tex)
+	name_scr = _scrawl("", 40, INK, 1.4)
+	col.add_child(name_scr)
 	for k in 2:
 		var a := TextureButton.new()
 		a.texture_normal = load(UI + ("arrow_l.png" if k == 0 else "arrow_r.png"))
 		a.ignore_texture_size = true
 		a.stretch_mode = TextureButton.STRETCH_KEEP_ASPECT_CENTERED
 		a.size = Vector2(54, 46)
-		a.position = Vector2(46 if k == 0 else 440, 532)
+		a.position = Vector2(46 if k == 0 else 440, 508)
 		a.set_meta("x", a.position.x)
 		a.focus_mode = FOCUS_NONE
 		a.pressed.connect(_step.bind(-1 if k == 0 else 1))
@@ -315,7 +318,7 @@ func _build_info() -> void:
 	var row := HBoxContainer.new()
 	row.alignment = BoxContainer.ALIGNMENT_CENTER
 	row.add_theme_constant_override("separation", 10)
-	row.position = Vector2(20, 590)
+	row.position = Vector2(20, 564)
 	row.size = Vector2(500, 46)
 	row.rotation = 0.012
 	row.mouse_filter = MOUSE_FILTER_IGNORE
@@ -368,12 +371,29 @@ func _show_info(idx: int) -> void:
 	shown = idx
 	var id: String = ids[idx]
 	var rnd := id == RANDOM
-	var tex: Texture2D = load(UI + ("random.png" if rnd else "name_%s.png" % id))
+	var path: String = UI + ("random.png" if rnd else "name_%s.png" % id)
+	var has_png := ResourceLoader.exists(path)
+	name_tex.visible = has_png
+	name_scr.visible = not has_png
+	if not has_png:
+		var nm: String = str(D.CHARACTERS[id].name).to_upper()
+		name_scr.set_text(nm)
+		var fs := 40
+		while name_scr.size.x > 440 and fs > 22:
+			fs -= 4
+			name_scr.fsize = fs
+			name_scr.set_text(nm)
+		name_scr.pivot_offset = name_scr.size / 2
+		name_scr.position = Vector2(270, 531) - name_scr.size / 2
+		name_scr.rotation = (hash(id) % 7 - 3) * 0.008
+	var tex: Texture2D = load(path) if has_png else null
+	if tex == null:
+		tex = name_tex.texture
 	var k := 2.6 if not rnd else 2.2
 	name_tex.size = tex.get_size() * k
 	name_tex.texture = tex
 	name_tex.pivot_offset = name_tex.size / 2
-	name_tex.position = Vector2(270, 555) - name_tex.size / 2
+	name_tex.position = Vector2(270, 531) - name_tex.size / 2
 	name_tex.rotation = (hash(id) % 7 - 3) * 0.008  # cada nome levemente torto, sempre igual
 	name_tex.scale = Vector2(1.12, 1.12)
 	name_tex.create_tween().tween_property(name_tex, "scale", Vector2.ONE, 0.18).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
