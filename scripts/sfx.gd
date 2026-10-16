@@ -3,7 +3,7 @@ extends Node
 # Uso: Sfx.play("evento" [, pitch, dB extra]) · Sfx.later("evento", seg) · Sfx.riffle() (embaralhar).
 # Anti-repetição: sorteia amostra sem repetir a anterior + pitch aleatório.
 # Anti-estouro: cooldown e limite de vozes por evento, pool fixo (rouba a voz mais antiga) e limitador no bus.
-# Amostras em assets/sfx/<nome>.wav (vindas de ../tboi sounds/, nome em minúsculas com "_").
+# Amostras em assets/sfx/<nome>.wav (vindas de ../tboi sounds/, nome em minúsculas com "_"); outro formato vai com extensão.
 
 const DIR := "res://assets/sfx/"
 const VOICES := 16
@@ -18,11 +18,10 @@ const EV := {
 	"board_out": [["menu_notehide"], 0.0, 0.05, 0.1, 1],
 	"game_start": [["door_heavy_open"], -11.0, 0.04, 0.5, 1],
 	# --- seleção de personagem (para a tela de seleção) ---
-	"char_left": [["character_select_left"], -12.0, 0.04, 0.03, 2],
-	"char_right": [["character_select_right"], -12.0, 0.04, 0.03, 2],
 	"char_flip": [["charactermenufliplight"], -8.0, 0.05, 0.1, 1],
 	"char_flip_dark": [["charactermenuflipdark"], -15.0, 0.03, 0.3, 1],
 	"char_pick": [["charactermenurip"], -3.0, 0.03, 0.3, 1],
+	"run_start": [["run_start.ogg"], -4.0, 0.0, 1.0, 1],  # início da run (escolha do personagem)
 	# --- cartas ---
 	"card_slide": [["paper_in", "paper_out"], -14.0, 0.15, 0.06, 2],
 	"card_tap": [["character_select_left", "character_select_right"], -17.0, 0.1, 0.05, 2],
@@ -44,7 +43,8 @@ const EV := {
 	"event": [["summonsound"], -14.0, 0.05, 0.3, 1],
 	"attack": [["whip_01", "whip_02", "whip_03", "whip_04"], -13.0, 0.08, 0.1, 1],
 	"swing": [["whip_01", "whip_02", "whip_03", "whip_04"], -10.0, 0.1, 0.08, 1],
-	"dice": [["bone_bounce_01", "bone_bounce_02", "bone_bounce_03", "bone_bounce_04"], -9.0, 0.1, 0.05, 2],
+	"dice": [["pop_impact_09", "pop_impact_15"], -3.0, 0.12, 0.05, 2],  # baque seco (osso soava metálico)
+	"dice_clack": [["shell_game_0", "shell_game_1"], -20.0, 0.1, 0.1, 1],
 	"roll_6": [["thumbs_up"], -19.0, 0.02, 0.2, 1],
 	"roll_1": [["thumbs_down"], -19.0, 0.02, 0.2, 1],
 	"mon_hit": [["meat_impact", "meat_impacts_2", "meat_impacts_3"], -6.0, 0.1, 0.05, 2],
@@ -153,5 +153,5 @@ func _voice(ev: String, cap: int) -> AudioStreamPlayer:
 
 func _stream(name: String) -> AudioStream:
 	if not _cache.has(name):
-		_cache[name] = load(DIR + name + ".wav")
+		_cache[name] = load(DIR + name + ("" if "." in name else ".wav"))
 	return _cache[name]

@@ -291,7 +291,6 @@ func _step(dir: int) -> void:
 	if busy:
 		return
 	target = roundf(target) + dir
-	Sfx.play("char_left" if dir < 0 else "char_right")
 	var a: Control = arrows[0 if dir < 0 else 1]
 	var tw := a.create_tween()
 	tw.tween_property(a, "position:x", a.get_meta("x") + dir * 8.0, 0.06)
@@ -364,9 +363,9 @@ func _build_info() -> void:
 	col.add_child(item_q)
 
 func _show_info(idx: int) -> void:
+	if shown >= 0:
+		Sfx.play("card_tap", 1.15)  # tique a cada carta que passa no centro (setas, arrasto, inércia, roleta)
 	shown = idx
-	if spinning:
-		Sfx.play("card_tap", 1.15)  # tique de roleta a cada carta no centro
 	var id: String = ids[idx]
 	var rnd := id == RANDOM
 	var tex: Texture2D = load(UI + ("random.png" if rnd else "name_%s.png" % id))
@@ -543,7 +542,7 @@ func _confirm() -> void:
 		target = dest
 		idx = k
 	chosen = ids[idx]
-	Sfx.play("char_pick")
+	Sfx.play("run_start")
 	_reroll = false
 	var face: Control = cards[idx].get_node("Face")
 	var pt := face.create_tween()

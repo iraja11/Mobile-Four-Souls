@@ -80,6 +80,7 @@ func throw(v: int, from: Vector3, to: Vector3) -> void:
 		p.y = to.y + (from.y - to.y) * (1.0 - t) * absf(cos(t * PI * 2.5))
 		position = p
 	# Quiques em t = 0.2, 0.6 e 1.0 (zeros do |cos| em `step`), cada um mais fraco.
+	Sfx.later("dice_clack", 0.85 * 0.2)
 	for k in 3:
 		Sfx.later("dice", 0.85 * (0.2 + 0.4 * k), 1.0 + 0.05 * k, -5.0 * k)
 	var tw := create_tween().set_parallel()
